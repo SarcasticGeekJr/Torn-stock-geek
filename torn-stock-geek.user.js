@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Torn Stock Geek
 // @namespace    https://github.com/SarcasticGeekJr/torn-stock-geek
-// @version      0.2.0
-// @description  A stock advisor for Torn: ranks the next benefit block of every stock by yearly return, plans what to buy with your cash, compares with your bank rate, tracks your portfolio, and shows price charts with swing-trading signals. Built for Torn PDA, works in Tampermonkey too.
+// @version      0.3.0
+// @description  A stock advisor for Torn: ranks the next benefit block of every stock by yearly return, plans what to buy with your cash, compares with your bank rate, tracks your portfolio, shows price charts with swing-trading signals, tests trading methods on each stock's real prices, and has a practice account. Built for Torn PDA, works in Tampermonkey too.
 // @author       SarcasticGeekJr
 // @match        https://www.torn.com/*
 // @grant        GM_xmlhttpRequest
@@ -27,6 +27,7 @@
  *   Tornsy (https://tornsy.com/api, free, no key): price history of every stock, collected each minute.
  *     /stocks?interval=h24,d7              current prices plus 24h and 7d ago
  *     /{acronym}?interval=d1&limit=400     daily candles [time, open, high, low, close, total_shares]
+ *     /{acronym}?interval=h1&limit=1000    hourly candles, to test day trading
  *
  * Rules: this script only reads data and shows advice. It never buys or sells anything.
  * Every action in the game is still yours.
@@ -40,7 +41,7 @@
 
   // ---------------------------------------------------------------- config
   const PDA_KEY = "###PDA-APIKEY###"; // Torn PDA replaces this with your key at runtime
-  const VERSION = "0.2.0"; // keep in sync with @version above
+  const VERSION = "0.3.0"; // keep in sync with @version above
   const UPDATE_URL = "https://raw.githubusercontent.com/SarcasticGeekJr/torn-stock-geek/main/torn-stock-geek.user.js";
   const TORN = "https://api.torn.com";
   const TORNSY = "https://tornsy.com/api";
@@ -70,6 +71,7 @@
     budget: 0, // planner cash
     tab: "advisor",
     tradeFilter: "all",
+    tradeSort: "zone", // or "record"
     range: "1M", // chart range
     custom: {}, // acronym -> $ value of one payout (active) or $ per year (passive), set by the user
     fab: null, // { right, bottom } in px once dragged
@@ -642,6 +644,140 @@
     return { cls: "even", icon: "⚪", short: "wait", text: `Price is ${where} of its 20-day range. Swing buyers wait for ${price(g.lo + (g.hi - g.lo) * SWING_LO)} or lower.` };
   }
 
+  // ---------------------------------------------------------------- strategy scorecard
+  // Replays a rule on closing prices from day `start`: decide(i) says "buy", "sell" or nothing.
+  // All-in, long only (Torn has no short selling), the 0.1% fee on every sale.
+  function replay(closes, start, decide) {
+    let cash = 1, sh = 0, entry = 0;
+    const trades = [];
+    for (let i = start; i < closes.length; i++) {
+      const a = decide(i);
+      if (a === "buy" && !sh) {
+        sh = cash / closes[i];
+        cash = 0;
+        entry = closes[i];
+      } else if (a === "sell" && sh) {
+        cash = sh * closes[i] * (1 - SELL_FEE);
+        trades.push((closes[i] * (1 - SELL_FEE)) / entry - 1);
+        sh = 0;
+      }
+    }
+    if (sh) cash = sh * closes[closes.length - 1] * (1 - SELL_FEE);
+    return { ret: cash - 1, trades: trades.length, wins: trades.filter((t) => t > 0).length, open: !!sh };
+  }
+  function smaAt(x, n, i) {
+    if (i < n - 1) return null;
+    let t = 0;
+    for (let k = i - n + 1; k <= i; k++) t += x[k];
+    return t / n;
+  }
+  function rsiSeries(x, n = 14) {
+    const out = new Array(x.length).fill(null);
+    let g = 0, l = 0;
+    for (let i = 1; i < x.length; i++) {
+      const ch = x[i] - x[i - 1];
+      const up = Math.max(ch, 0), dn = Math.max(-ch, 0);
+      if (i <= n) {
+        g += up / n;
+        l += dn / n;
+      } else {
+        g = (g * (n - 1) + up) / n;
+        l = (l * (n - 1) + dn) / n;
+      }
+      if (i >= n) out[i] = l === 0 ? 100 : 100 - 100 / (1 + g / l);
+    }
+    return out;
+  }
+  const rangeRule = (x, n) => (i) => {
+    if (i < n) return null;
+    const w = x.slice(i - n, i);
+    const lo = Math.min(...w), hi = Math.max(...w);
+    if (hi <= lo) return null;
+    const p = (x[i] - lo) / (hi - lo);
+    return p < SWING_LO ? "buy" : p > SWING_HI ? "sell" : null;
+  };
+  const rsiRule = (x) => {
+    const r = rsiSeries(x);
+    return (i) => (r[i] == null ? null : r[i] < 30 ? "buy" : r[i] > 70 ? "sell" : null);
+  };
+  const METHODS = [
+    { name: "Swing, 20 days", how: "Buy in the bottom 10% of the last 20 days' price range, sell in the top 10%. (The Trade tab's signal.)", make: (x) => rangeRule(x, 20) },
+    { name: "Fast swing, 10 days", how: "The same with the last 10 days: more trades, smaller moves.", make: (x) => rangeRule(x, 10) },
+    { name: "Dip buying (RSI)", how: "Buy when RSI(14) drops below 30 (the price fell fast), sell when it goes above 70.", make: rsiRule },
+    { name: "Trend following", how: "Buy when the 20-day average price crosses above the 100-day average, sell when it crosses back below.",
+      make: (x) => (i) => {
+        const a = smaAt(x, 20, i), b = smaAt(x, 100, i), a0 = smaAt(x, 20, i - 1), b0 = smaAt(x, 100, i - 1);
+        if (a == null || b == null || a0 == null || b0 == null) return null;
+        return a > b && a0 <= b0 ? "buy" : a < b && a0 >= b0 ? "sell" : null;
+      } },
+  ];
+
+  // Every method on the last year of one stock's daily prices, next to just holding and the bank.
+  function scorecard(acr) {
+    const dd = data.daily[acr];
+    if (!dd || dd.close.length < 120) return null;
+    const x = dd.close;
+    const start = Math.max(0, x.length - 365);
+    const days = x.length - start;
+    const rows = METHODS.map((m) => Object.assign({ name: m.name, how: m.how }, replay(x, start, m.make(x))));
+    const hold = (x[x.length - 1] * (1 - SELL_FEE)) / x[start] - 1;
+    const bank = (bankApr() / 100) * (days / 365);
+    return { rows, hold, bank, days };
+  }
+
+  // Day trading test: the same ideas on hourly prices (about the last 6 weeks).
+  async function dayTradeTest(acr) {
+    const d = await tornsy(`/${acr.toLowerCase()}?interval=h1&limit=1000`, 30 * MIN);
+    const x = (d.data || []).filter((r) => r && r.length >= 5).map((r) => +r[4]);
+    if (x.length < 100) return null;
+    const rows = [
+      Object.assign({ name: "Hourly swing, 24 hours" }, replay(x, 24, rangeRule(x, 24))),
+      Object.assign({ name: "Hourly dip buying (RSI)" }, replay(x, 15, rsiRule(x))),
+    ];
+    return { rows, hold: (x[x.length - 1] * (1 - SELL_FEE)) / x[24] - 1, days: Math.round(x.length / 24) };
+  }
+
+  // ---------------------------------------------------------------- practice account
+  // Fake money to try trading without risk. Buys and sells at the live price, with the real 0.1% fee.
+  const PAPER_START = 1e9;
+  const paperNew = (start = PAPER_START) => ({ cash: start, start, pos: {}, log: [], since: Date.now() });
+  let paper = Object.assign(paperNew(), store.get("paper", {}));
+  const savePaper = () => store.set("paper", paper);
+  const livePrice = (acr) => (data.live && data.live[acr] && data.live[acr].price) || (stockByAcr(acr) || {}).price || 0;
+  function paperValue() {
+    let v = paper.cash;
+    for (const [a, p] of Object.entries(paper.pos)) v += p.sh * (livePrice(a) || p.cost / p.sh) * (1 - SELL_FEE);
+    return v;
+  }
+  function paperBuy(acr, dollars) {
+    const px = livePrice(acr);
+    if (!px) return "No price yet, try again in a moment.";
+    const sh = Math.floor(Math.min(dollars, paper.cash) / px);
+    if (sh < 1) return "Not enough practice cash.";
+    const p = paper.pos[acr] || (paper.pos[acr] = { sh: 0, cost: 0 });
+    p.sh += sh;
+    p.cost += sh * px;
+    paper.cash -= sh * px;
+    paper.log.unshift({ t: Date.now(), acr, side: "buy", sh, px });
+    paper.log = paper.log.slice(0, 50);
+    savePaper();
+    return `Bought ${commas(sh)} ${acr} at ${price(px)} (practice).`;
+  }
+  function paperSell(acr) {
+    const p = paper.pos[acr];
+    const px = livePrice(acr);
+    if (!p || !p.sh) return "You have no practice shares of " + acr + ".";
+    if (!px) return "No price yet, try again in a moment.";
+    const got = p.sh * px * (1 - SELL_FEE);
+    const pl = got - p.cost;
+    paper.cash += got;
+    paper.log.unshift({ t: Date.now(), acr, side: "sell", sh: p.sh, px, pl });
+    paper.log = paper.log.slice(0, 50);
+    delete paper.pos[acr];
+    savePaper();
+    return `Sold ${commas(got / px / (1 - SELL_FEE))} ${acr} at ${price(px)}: ${pl >= 0 ? "profit" : "loss"} ${money(Math.abs(pl))} (practice).`;
+  }
+
   // ---------------------------------------------------------------- formatting
   const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
   const commas = (n) => Math.round(n).toLocaleString("en-US");
@@ -649,8 +785,8 @@
     if (!isFinite(n)) return "—";
     const a = Math.abs(n);
     const sign = n < 0 ? "-" : "";
-    if (a >= 1e9) return `${sign}$${(a / 1e9).toFixed(a >= 1e10 ? 1 : 2)}b`;
-    if (a >= 1e6) return `${sign}$${(a / 1e6).toFixed(a >= 1e8 ? 0 : 1)}m`;
+    if (a >= 999.5e6) return `${sign}$${(a / 1e9).toFixed(a >= 1e10 ? 1 : 2)}b`;
+    if (a >= 999.5e3) return `${sign}$${(a / 1e6).toFixed(a >= 1e8 ? 0 : 1)}m`;
     if (a >= 1e3) return `${sign}$${(a / 1e3).toFixed(a >= 1e5 ? 0 : 1)}k`;
     return `${sign}$${a.toFixed(a < 10 ? 2 : 0)}`;
   }
@@ -762,21 +898,27 @@
 
   const TITLES = { settings: "Settings" };
   function render() {
-    const onStock = S.tab === "stock";
+    const onStock = S.tab === "stock" || S.tab === "practice";
     $$(".tab").forEach((b) => b.classList.toggle("on", b.dataset.tab === S.tab));
     $(".tabs").hidden = S.tab === "settings" || onStock;
     $("[data-act=back]").hidden = !onStock;
-    $(".title").textContent = onStock ? `${view.acr} ${(stockByAcr(view.acr) || (data.live && data.live[view.acr]) || {}).name || ""}` : TITLES[S.tab] || "Torn Stock Geek";
+    $(".title").textContent =
+      S.tab === "practice" ? "🎮 Practice account" : onStock ? `${view.acr} ${(stockByAcr(view.acr) || (data.live && data.live[view.acr]) || {}).name || ""}` : TITLES[S.tab] || "Torn Stock Geek";
     const scroll = body().scrollTop;
-    if (!apiKey() && !["settings", "trade", "stock"].includes(S.tab)) renderNoKey();
-    else ({ advisor: renderAdvisor, planner: renderPlanner, trade: renderTrade, portfolio: renderPortfolio, settings: renderSettings, stock: renderStock })[S.tab]();
+    if (!apiKey() && !["settings", "trade", "stock", "practice"].includes(S.tab)) renderNoKey();
+    else ({ advisor: renderAdvisor, planner: renderPlanner, trade: renderTrade, portfolio: renderPortfolio, settings: renderSettings, stock: renderStock, practice: renderPractice })[S.tab]();
     body().scrollTop = scroll;
   }
 
+  const SUB = ["settings", "stock", "practice"]; // pages with a back button instead of tabs
   function go(tab) {
-    if (tab === "stock") view.from = S.tab === "stock" ? view.from : S.tab;
+    if (tab === "stock" || tab === "practice") {
+      if (!SUB.includes(S.tab)) view.from = S.tab;
+      if (S.tab === "practice" && tab === "stock") view.back = "practice";
+      else if (tab === "stock") view.back = "";
+    }
     S.tab = tab;
-    if (!["settings", "stock"].includes(tab)) save();
+    if (!SUB.includes(tab)) save();
     render();
     body().scrollTop = 0;
   }
@@ -937,7 +1079,11 @@
     const f = S.tradeFilter;
     const shown = sigs
       .filter((g) => f === "all" || (f === "buy" && g.zone === "buy") || (f === "sell" && g.zone === "sell") || (f === "mine" && mineAcr.has(g.acr)))
-      .sort((a, b) => (a.pos ?? 2) - (b.pos ?? 2));
+      .sort((a, b) =>
+        S.tradeSort === "record"
+          ? (b.rec ? b.rec.ret : -9) - (a.rec ? a.rec.ret : -9)
+          : (a.pos ?? 2) - (b.pos ?? 2)
+      );
     const nBuy = sigs.filter((g) => g.zone === "buy").length;
     const nSell = sigs.filter((g) => g.zone === "sell").length;
     const idx = data.live.TCSE;
@@ -948,9 +1094,12 @@
         <ul><li><b>Day trading</b> (minutes or hours) <span class="r">lost money on every stock</span>. Moves that short are smaller than the fee.</li>
         <li><b>Swing trading</b> over days (buy when the price is in the bottom 10% of its last 20 days' range, sell in the top 10%) <span class="g">beat holding on most stocks</span>, in every year we checked.</li></ul>
         <p>Each stock shows how the rule did on it in the last year. Past results don't promise future ones. Only swing with shares you don't need for a benefit block.</p></details>
+      <button class="row practice-entry" data-act="practice"><span class="nm2">🎮 <b>Practice account</b><small>try trading with fake money</small></span>
+        <span class="rt">${money(paperValue())}<small>${chg(paperValue() / paper.start - 1)}</small></span></button>
       <div class="sorts">
         ${[["all", "All"], ["buy", `Buy zone (${nBuy})`], ["sell", `Sell zone (${nSell})`], ["mine", "Mine"]].map(([k, l]) => `<button class="seg ${f === k ? "on" : ""}" data-act="filter" data-f="${k}">${l}</button>`).join("")}
       </div>
+      <div class="sortby small muted">Sort: ${[["zone", "nearest buy zone"], ["record", "best swing record"]].map(([k, l]) => `<button class="link ${S.tradeSort === k ? "on" : ""}" data-act="tsort" data-k="${k}">${l}</button>`).join(" · ")}</div>
       <div class="progress muted small" ${data.dailyLoading ? "" : "hidden"}>Loading price history ${data.dailyDone}/${acrs.length}…</div>
       <div class="list">${shown.map(tradeRow).join("") || `<p class="muted">Nothing here right now.</p>`}</div>
       ${foot()}`;
@@ -969,7 +1118,7 @@
     const bar = g.pos != null ? `<span class="rbar"><i style="left:${Math.max(0, Math.min(100, g.pos * 100)).toFixed(0)}%"></i></span>` : "";
     return `<button class="row" data-act="stock" data-acr="${esc(g.acr)}">
       <span class="nm"><b>${esc(g.acr)}</b> <small>${esc(lv.name || "")}</small></span>
-      <span class="mid">${bar}<small>${g.rec && g.rec.trades ? `swing: won ${g.rec.wins}/${g.rec.trades}` : "&nbsp;"}</small></span>
+      <span class="mid">${bar}<small>${g.rec && g.rec.trades ? `swing ${signPct(g.rec.ret)}/yr · won ${g.rec.wins}/${g.rec.trades}` : "&nbsp;"}</small></span>
       <span class="rt">${price(g.price)}<small>${chg(g.ch24)} 24h</small></span>
       <span class="pill ${v.cls} zone">${v.icon} ${v.short}</span>
     </button>`;
@@ -1012,10 +1161,81 @@
         ${g.rec ? `<div class="line small muted">Last year with this rule: ${signPct(g.rec.ret)} vs ${signPct(g.rec.hold)} just holding · ${g.rec.trades} trades, ${g.rec.wins} won${g.rec.trades ? `, worst ${signPct(g.rec.worst)}` : ""}.</div>` : ""}
       </div>
       ${g.flow7 != null ? `<div class="line muted small flow">Players ${g.flow7 >= 0 ? "bought" : "sold"} ${pctTxt(Math.abs(g.flow7), 2)} of all shares this week${Math.abs(g.flow7) < 0.002 ? " (quiet)" : ""}.</div>` : ""}
+      ${scoreCardHtml(acr)}
+      ${practiceCard(acr)}
       ${s ? stockBlockInfo(s, have, held) : ""}
       <p class="muted small"><a href="${STOCKS_PAGE}" target="_top">Open the stock market</a> to buy or sell.</p>
       ${foot()}`;
     drawChart(acr);
+    drawDayTrade(acr);
+  }
+
+  function scoreCardHtml(acr) {
+    const sc = scorecard(acr);
+    if (!sc) return `<div class="card"><b>📊 Strategy scorecard</b><div class="line muted">Needs price history; loading…</div></div>`;
+    const best = Math.max(...sc.rows.map((r) => r.ret), sc.hold);
+    const row = (name, ret, extra, how) => `<div class="srow ${ret === best ? "best" : ""}">
+        <span class="sn">${esc(name)}${how ? `<small>${esc(how)}</small>` : ""}</span>
+        <span class="sv"><b class="${ret > 0 ? "g" : ret < 0 ? "r" : ""}">${signPct(ret)}</b><small>${extra}</small></span></div>`;
+    return `<div class="card score">
+      <b>📊 Strategy scorecard: ${esc(acr)}, last ${sc.days} days</b>
+      <div class="line small muted">What each method would have made on this stock, after the 0.1% fee. Best in green border.</div>
+      ${sc.rows.map((r) => row(r.name, r.ret, r.trades ? `${r.trades} trade${r.trades > 1 ? "s" : ""}, ${r.wins} won${r.open ? ", 1 open" : ""}` : r.open ? "1 trade, still open" : "no trades", r.how)).join("")}
+      ${row("Just holding", sc.hold, "buy once, sell at the end")}
+      ${sc.bank ? `<div class="srow"><span class="sn">Bank instead (${bankApr()}%/yr)</span><span class="sv"><b class="g">${signPct(sc.bank)}</b><small>no risk, money locked</small></span></div>` : ""}
+      <div class="daytrade line small muted">Day trading test (hourly prices): loading…</div>
+      <div class="line small muted">Past results don't promise future ones. A method that won here can lose next month.</div>
+    </div>`;
+  }
+
+  async function drawDayTrade(acr) {
+    let res = null;
+    try {
+      res = await dayTradeTest(acr);
+    } catch (e) {}
+    const box = $(".daytrade");
+    if (!box || S.tab !== "stock" || view.acr !== acr) return;
+    if (!res) return void (box.textContent = "Day trading test: couldn't load hourly prices.");
+    box.innerHTML = `<b class="tx">Day trading (hourly, last ${res.days} days):</b> ${res.rows.map((r) => `${esc(r.name)} ${chg(r.ret)} (${r.trades} trades, ${r.wins} won)`).join(" · ")} · holding ${chg(res.hold)}.`;
+  }
+
+  function practiceCard(acr) {
+    const p = paper.pos[acr];
+    const px = livePrice(acr);
+    const pl = p ? p.sh * px * (1 - SELL_FEE) - p.cost : 0;
+    return `<div class="card practice">
+      <div class="crow"><b class="grow">🎮 Practice (fake money)</b><button class="link" data-act="practice">account ›</button></div>
+      <div class="line muted">Practice cash ${money(paper.cash)}${p ? ` · you hold ${commas(p.sh)} ${esc(acr)} <span class="${pl >= 0 ? "g" : "r"}">${pl >= 0 ? "+" : ""}${money(pl)}</span>` : ""}</div>
+      <div class="pbuy"><input class="pamt" inputmode="decimal" placeholder="amount, e.g. 100m" autocomplete="off">
+        <button class="btn" data-act="pbuy" data-acr="${esc(acr)}">Buy</button>
+        ${p ? `<button class="btn ghost" data-act="psell" data-acr="${esc(acr)}">Sell all</button>` : ""}</div>
+    </div>`;
+  }
+
+  // ---------------------------------------------------------------- practice page
+  function renderPractice() {
+    const v = paperValue();
+    const pos = Object.entries(paper.pos);
+    const realized = paper.log.filter((l) => l.side === "sell").reduce((a, l) => a + (l.pl || 0), 0);
+    body().innerHTML = `
+      <div class="stats">
+        <div class="stat"><span>Account value</span><b>${money(v)}</b><small>started with ${money(paper.start)}</small></div>
+        <div class="stat"><span>Profit / loss</span><b class="${v >= paper.start ? "g" : "r"}">${money(v - paper.start)}</b><small>${signPct(v / paper.start - 1)} · cash ${money(paper.cash)}</small></div>
+      </div>
+      <p class="muted small">Fake money only: nothing happens in Torn. Buy and sell from any stock's page (Trade tab → tap a stock). Prices are live and the 0.1% fee is real, so you can test the signals before using real money.</p>
+      <h3>Holding</h3>
+      ${pos.length ? `<div class="list">${pos.map(([a, p]) => {
+        const px = livePrice(a);
+        const val = p.sh * px * (1 - SELL_FEE);
+        return `<button class="row" data-act="stock" data-acr="${esc(a)}"><span class="nm"><b>${esc(a)}</b><small>${shares(p.sh)} sh</small></span>
+          <span class="mid small muted">bought ${price(p.cost / p.sh)} · now ${price(px)}</span>
+          <span class="rt">${money(val)}<small>${chg(val / p.cost - 1)}</small></span></button>`;
+      }).join("")}</div>` : `<p class="muted">Nothing yet.</p>`}
+      <h3>Trades${realized ? ` · closed trades ${realized >= 0 ? "made" : "lost"} ${money(Math.abs(realized))}` : ""}</h3>
+      ${paper.log.length ? `<div class="log">${paper.log.slice(0, 20).map((l) => `<div class="small"><span class="muted">${new Date(l.t).toISOString().slice(5, 16).replace("T", " ")}</span> ${l.side === "buy" ? "Bought" : "Sold"} ${shares(l.sh)} <b>${esc(l.acr)}</b> at ${price(l.px)}${l.pl != null ? ` <span class="${l.pl >= 0 ? "g" : "r"}">${l.pl >= 0 ? "+" : ""}${money(l.pl)}</span>` : ""}</div>`).join("")}</div>` : `<p class="muted small">No trades yet.</p>`}
+      <h3>Start over</h3>
+      <div class="pbuy"><input class="preset-amt" inputmode="decimal" value="${esc(money(paper.start).replace("$", ""))}" autocomplete="off"><button class="btn ghost" data-act="preset">Reset account</button></div>
+      ${foot()}`;
   }
 
   function stockBlockInfo(s, have, held) {
@@ -1179,7 +1399,7 @@
     const pda = !PDA_KEY.includes("#");
     const b = bankRate();
     body().innerHTML = `
-      <button class="link back" data-act="tab" data-tab="${esc(view.from && view.from !== "stock" ? view.from : "advisor")}">‹ Back</button>
+      <button class="link back" data-act="tab" data-tab="${esc(view.from && !SUB.includes(view.from) ? view.from : "advisor")}">‹ Back</button>
       <h3>API key</h3>
       <p class="muted small">${pda ? "Torn PDA is giving the script your key. You only need this box to use a different key." : "Paste a Torn API key. A <b>Limited</b> key is needed for the Mine tab; Public works for the rest."}</p>
       <input class="set-key" type="password" placeholder="${pda ? "using Torn PDA key" : "API key"}" value="${esc(S.apiKey)}" autocomplete="off">
@@ -1273,10 +1493,13 @@
     } else if (act === "close") close();
     else if (act === "refresh") refresh(true);
     else if (act === "tab") {
-      if (b.dataset.tab === "settings" && S.tab !== "settings") view.from = S.tab;
+      if (b.dataset.tab === "settings" && !SUB.includes(S.tab)) view.from = S.tab;
       go(b.dataset.tab);
       if (!["settings", "trade"].includes(S.tab) && apiKey() && !data.market) refresh(false);
-    } else if (act === "back") go(view.from || "trade");
+    } else if (act === "back") {
+      if (S.tab === "stock" && view.back === "practice") go("practice");
+      else go(view.from || "trade");
+    }
     else if (act === "stock") {
       view.acr = b.dataset.acr;
       go("stock");
@@ -1285,6 +1508,25 @@
       save();
       $$("[data-act=range]").forEach((x) => x.classList.toggle("on", x.dataset.r === S.range));
       drawChart(view.acr);
+    } else if (act === "practice") go("practice");
+    else if (act === "pbuy") {
+      const amt = parseMoney(($(".pamt") || {}).value);
+      if (!amt) return toast("Type an amount first, e.g. 100m", "bad");
+      toast(paperBuy(b.dataset.acr, amt), "", 3000);
+      render();
+    } else if (act === "psell") {
+      toast(paperSell(b.dataset.acr), "", 3500);
+      render();
+    } else if (act === "preset") {
+      const amt = parseMoney(($(".preset-amt") || {}).value) || PAPER_START;
+      if (!confirm(`Reset the practice account to ${money(amt)}? Your practice trades will be cleared.`)) return;
+      paper = paperNew(amt);
+      savePaper();
+      render();
+    } else if (act === "tsort") {
+      S.tradeSort = b.dataset.k;
+      save();
+      render();
     } else if (act === "filter") {
       S.tradeFilter = b.dataset.f;
       save();
@@ -1436,6 +1678,21 @@ input.num { width: 90px; }
 .chart .bl.lo { stroke: var(--g); } .chart .bl.hi { stroke: var(--r); }
 .chart .bt { font-size: 9.5px; } .chart .bt.lo { fill: var(--g); } .chart .bt.hi { fill: var(--r); }
 .flow { margin: 0 2px 8px; }
+.score .srow { display: flex; align-items: flex-start; gap: 8px; padding: 6px 8px; border: 1px solid transparent; border-radius: 9px; }
+.score .srow.best { border-color: rgba(127,220,111,.55); }
+.score .sn { flex: 1; min-width: 0; font-size: 13px; font-weight: 600; }
+.score .sn small, .score .sv small { display: block; font-size: 11px; font-weight: 400; color: var(--muted); }
+.score .sv { text-align: right; flex: none; font-size: 14px; }
+.pbuy { display: flex; gap: 6px; align-items: center; margin-top: 4px; }
+.pbuy input { flex: 1; min-width: 0; }
+.pbuy .btn { flex: none; }
+.practice-entry { margin: 8px 0 0; border-style: dashed; }
+.practice-entry .nm2 { flex: 1; }
+.practice-entry .nm2 small { display: block; font-size: 11px; color: var(--muted); }
+.sortby { margin: -2px 2px 8px; }
+.sortby .link { color: var(--muted); text-decoration: none; }
+.sortby .link.on { color: var(--acc); font-weight: 700; }
+.log { display: grid; gap: 4px; }
 .toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); z-index: 2147483003; background: var(--bg3); color: var(--text);
   border: 1px solid var(--line); border-radius: 10px; padding: 9px 14px; font-size: 14px; box-shadow: 0 4px 14px rgba(0,0,0,.4); }
 .toast.bad { border-color: var(--r); }

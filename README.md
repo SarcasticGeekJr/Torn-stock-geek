@@ -36,7 +36,13 @@ Tap the 📈 button (you can drag it).
 **Trade** (charts and signals, no key needed)
 - Every stock with its place in the **last 20 days' price range**: 🟢 buy zone (bottom 10%), 🔴 sell zone (top 10%), ⚪ wait.
 - How that swing rule did on each stock in the last year (trades won).
+- Sort by nearest buy zone or by best swing record.
 - Tap a stock: price chart (1D, 1W, 1M, 1Y, 5Y), 24h/7d/30d change, whether players are buying or selling, and its benefit block.
+- **Strategy scorecard** on each stock: what swing (20 and 10 days), dip buying (RSI), trend following, just holding, and the bank would have made in the last year after fees, plus a **day trading test** on hourly prices.
+
+**🎮 Practice account**
+- Fake money (starts at $1b) to try trading with live prices and the real 0.1% fee. Nothing happens in Torn.
+- Buy and sell from any stock's page; see your holdings, profit and trade history. Reset any time.
 
 **Mine**
 - Value, profit/loss, and yearly payouts of everything you own.
@@ -57,5 +63,4 @@ Tested on 5 years of Torn prices (from Tornsy), after the 0.1% sell fee:
 - Perks (passive) need one block, held for 7 days.
 
 ## Coming next
-- v0.3: strategy scorecard (tests trading methods on past prices) and practice mode.
 - v0.4: alerts, trade plan, fill-amount button on the stock page.
