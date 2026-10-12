@@ -2,7 +2,7 @@
 
 A stock advisor for [Torn](https://www.torn.com). It tells you which stock benefit blocks pay the most for your money, plans what to buy with your cash, tracks your portfolio, and shows charts with swing-trading signals tested on 5 years of real Torn prices. Built for **Torn PDA**, works in **Tampermonkey** too.
 
-It only reads data and gives advice. **It never buys or sells anything.**
+It only reads data and gives advice. **It never buys or sells anything.** On Torn's stock page it can type a number of shares into Torn's box when you tap its button; you still press BUY/SELL yourself.
 
 ## Install
 
@@ -40,6 +40,19 @@ Tap the 📈 button (you can drag it).
 - Tap a stock: price chart (1D, 1W, 1M, 1Y, 5Y), 24h/7d/30d change, whether players are buying or selling, and its benefit block.
 - **Strategy scorecard** on each stock: what swing (20 and 10 days), dip buying (RSI), trend following, just holding, and the bank would have made in the last year after fees, plus a **day trading test** on hourly prices.
 
+- **Swing trade plan** on each stock: how many shares for your amount, a target (sell zone) and a stop-loss, what you'd make or lose, break-even after the fee, and one tap to set alerts at both.
+
+**🔔 Alerts**
+- Per stock: price above / below, or when it enters the swing buy or sell zone.
+- Benefit payout ready to collect (Limited key).
+- A banner on any Torn page, a badge on the 📈 button, and a vibration. Checked once a minute **while a Torn page is open**; they can't reach you when Torn is closed.
+
+**📈 Fill shares (on Torn's stock market page)**
+- Open a stock's BUY or SELL panel: under Torn's shares box you get buttons like "Plan $100m: 114,429", "For block 2: 1,000,000" or "All but blocks: 100,000". Tapping one only types the number. You still press BUY/SELL and confirm.
+
+**🛡 Park cash safely** (Planner tab)
+- The calmest stocks lately, for keeping cash where it can't be mugged (selling costs 0.1%).
+
 **🎮 Practice account**
 - Fake money (starts at $1b) to try trading with live prices and the real 0.1% fee. Nothing happens in Torn.
 - Buy and sell from any stock's page; see your holdings, profit and trade history. Reset any time.
@@ -62,5 +75,6 @@ Tested on 5 years of Torn prices (from Tornsy), after the 0.1% sell fee:
 - Each extra block of the same stock costs **double** the shares of the one before, so it earns about half the return.
 - Perks (passive) need one block, held for 7 days.
 
-## Coming next
-- v0.4: alerts, trade plan, fill-amount button on the stock page.
+## Not yet checked on the real site
+- The fill-shares buttons depend on how Torn's stock page is built; if Torn changes it, they just won't show.
+- The payout-ready alert relies on Torn's `dividend.ready` field.

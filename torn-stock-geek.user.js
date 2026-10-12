@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Torn Stock Geek
 // @namespace    https://github.com/SarcasticGeekJr/torn-stock-geek
-// @version      0.3.0
-// @description  A stock advisor for Torn: ranks the next benefit block of every stock by yearly return, plans what to buy with your cash, compares with your bank rate, tracks your portfolio, shows price charts with swing-trading signals, tests trading methods on each stock's real prices, and has a practice account. Built for Torn PDA, works in Tampermonkey too.
+// @version      0.4.0
+// @description  A stock advisor for Torn: ranks the next benefit block of every stock by yearly return, plans what to buy with your cash, compares with your bank rate, tracks your portfolio, shows price charts with swing-trading signals, tests trading methods on each stock's real prices, has a practice account, price and payout alerts, a trade plan, and a fill-amount helper on the stock page. Built for Torn PDA, works in Tampermonkey too.
 // @author       SarcasticGeekJr
 // @match        https://www.torn.com/*
 // @grant        GM_xmlhttpRequest
@@ -30,7 +30,8 @@
  *     /{acronym}?interval=h1&limit=1000    hourly candles, to test day trading
  *
  * Rules: this script only reads data and shows advice. It never buys or sells anything.
- * Every action in the game is still yours.
+ * On the stock market page it can type a number of shares into Torn's box when you tap one of its
+ * buttons; you still press Torn's own BUY/SELL and confirm. Every action in the game is yours.
  */
 
 (function () {
@@ -41,7 +42,7 @@
 
   // ---------------------------------------------------------------- config
   const PDA_KEY = "###PDA-APIKEY###"; // Torn PDA replaces this with your key at runtime
-  const VERSION = "0.3.0"; // keep in sync with @version above
+  const VERSION = "0.4.0"; // keep in sync with @version above
   const UPDATE_URL = "https://raw.githubusercontent.com/SarcasticGeekJr/torn-stock-geek/main/torn-stock-geek.user.js";
   const TORN = "https://api.torn.com";
   const TORNSY = "https://tornsy.com/api";
@@ -72,6 +73,12 @@
     tab: "advisor",
     tradeFilter: "all",
     tradeSort: "zone", // or "record"
+    planAmt: 100e6, // trade plan: money to use
+    alerts: {}, // acronym -> { above, below, zone, last }
+    alertsOn: true,
+    vibrate: true,
+    payoutAlert: true, // tell me when a benefit payout is ready to collect
+    inbox: [], // alerts that went off: { t, acr, text, seen }
     range: "1M", // chart range
     custom: {}, // acronym -> $ value of one payout (active) or $ per year (passive), set by the user
     fab: null, // { right, bottom } in px once dragged
@@ -778,6 +785,210 @@
     return `Sold ${commas(got / px / (1 - SELL_FEE))} ${acr} at ${price(px)}: ${pl >= 0 ? "profit" : "loss"} ${money(Math.abs(pl))} (practice).`;
   }
 
+  // ---------------------------------------------------------------- trade plan
+  // Typical daily move (standard deviation of daily changes) over the last 60 days.
+  function dailyVol(acr, n = 60) {
+    const x = data.daily[acr] && data.daily[acr].close;
+    if (!x || x.length < n + 1) return null;
+    const r = [];
+    for (let i = x.length - n; i < x.length; i++) r.push(x[i] / x[i - 1] - 1);
+    const m = r.reduce((a, b) => a + b, 0) / r.length;
+    return Math.sqrt(r.reduce((a, b) => a + (b - m) * (b - m), 0) / r.length);
+  }
+
+  // Shares, target, stop-loss and what each would mean, for a swing trade of `amount` dollars.
+  function tradePlan(acr, amount) {
+    const g = signal(acr);
+    if (g.lo == null || !g.price) return null;
+    const vol = dailyVol(acr) || 0.005;
+    const sh = Math.floor(amount / g.price);
+    const target = g.lo + (g.hi - g.lo) * SWING_HI;
+    const stop = Math.min(g.lo, g.price) * (1 - 2 * vol);
+    const cost = sh * g.price;
+    const win = sh * target * (1 - SELL_FEE) - cost;
+    const loss = sh * stop * (1 - SELL_FEE) - cost;
+    return { g, sh, cost, target, stop, win, loss, be: g.price / (1 - SELL_FEE), ratio: loss < 0 ? win / -loss : 0, vol };
+  }
+
+  // ---------------------------------------------------------------- alerts
+  // Checked once a minute while any Torn page is open (one tab does the checking). Nothing runs when Torn is closed.
+  const MON_EVERY = 60 * 1000;
+  const alertCount = () => Object.keys(S.alerts).length;
+  function notify(acr, text) {
+    S.inbox.unshift({ t: Date.now(), acr, text, seen: false });
+    S.inbox = S.inbox.slice(0, 20);
+    save();
+    showBanner(acr, text);
+    badge();
+    if (S.vibrate && navigator.vibrate) {
+      try {
+        navigator.vibrate([200, 100, 200]);
+      } catch {}
+    }
+  }
+  let bannerT = 0;
+  function showBanner(acr, text) {
+    const b = $(".banner");
+    b.innerHTML = `<span>🔔 ${esc(text)}</span><button class="ib sm" data-act="bannerclose">✕</button>`;
+    b.dataset.acr = acr;
+    b.hidden = false;
+    clearTimeout(bannerT);
+    bannerT = setTimeout(() => (b.hidden = true), 12000);
+  }
+  function badge() {
+    const n = S.inbox.filter((x) => !x.seen).length;
+    const el = $(".fab-badge");
+    el.textContent = n > 9 ? "9+" : n;
+    el.hidden = !n;
+  }
+
+  async function monitor() {
+    // Only one Torn tab checks, so alerts don't go off twice.
+    const lock = store.get("mon", 0);
+    if (Date.now() - lock < MON_EVERY - 5000 && store.get("monTab", "") !== TAB_ID) return;
+    store.set("mon", Date.now());
+    store.set("monTab", TAB_ID);
+    Object.assign(S, { alerts: store.get("settings", {}).alerts || S.alerts }); // pick up changes made in other tabs
+    if (S.alertsOn && alertCount()) {
+      await loadLive();
+      let changed = false;
+      for (const [acr, a] of Object.entries(S.alerts)) {
+        const px = livePrice(acr);
+        if (!px) continue;
+        if (a.above && px >= a.above) {
+          notify(acr, `${acr} is ${price(px)}, above your ${price(a.above)}.`);
+          a.above = 0;
+          changed = true;
+        }
+        if (a.below && px <= a.below) {
+          notify(acr, `${acr} is ${price(px)}, below your ${price(a.below)}.`);
+          a.below = 0;
+          changed = true;
+        }
+        if (a.zone) {
+          const c = data.daily[acr] || store.get("d_" + acr, null);
+          if (!c || Date.now() - c.t > DAILY_TTL) await loadDaily(acr);
+          else data.daily[acr] = c;
+          const z = signal(acr).zone;
+          if (z && z !== a.last) {
+            if (z === "buy") notify(acr, `${acr} entered the swing buy zone (${price(px)}).`);
+            if (z === "sell") notify(acr, `${acr} entered the swing sell zone (${price(px)}).`);
+            a.last = z;
+            changed = true;
+          }
+        }
+        if (!a.above && !a.below && !a.zone) {
+          delete S.alerts[acr];
+          changed = true;
+        }
+      }
+      if (changed) save();
+    }
+    // Payouts ready to collect, checked every 10 minutes (needs a Limited key).
+    if (S.alertsOn && S.payoutAlert && apiKey() && Date.now() - store.get("payChk", 0) > 10 * MIN) {
+      store.set("payChk", Date.now());
+      await Promise.all([loadMarket(), loadMine()]);
+      const told = store.get("payTold", {});
+      const day = new Date().toISOString().slice(0, 10);
+      for (const h of Object.values(data.mine || {})) {
+        const st = (data.market || []).find((x) => x.id === h.id);
+        if (!st || !h.payout || !h.payout.ready || st.type !== "active") continue;
+        if (told[st.acr] === day) continue;
+        told[st.acr] = day;
+        notify(st.acr, `${st.acr} payout is ready to collect on the stock market page.`);
+      }
+      store.set("payTold", told);
+    }
+  }
+  const TAB_ID = Math.random().toString(36).slice(2);
+
+  // ---------------------------------------------------------------- stock page helper
+  // On Torn's stock market page, adds a small row under the shares box of an open BUY/SELL panel.
+  // Tapping one of its buttons only types a number into Torn's box. You still press BUY/SELL and confirm.
+  const isStocksPage = () => /sid=stocks/.test(location.href);
+  function acrFromRow(el) {
+    const row = el.closest('ul[class*="stock___"]') || el.closest('[class*="stock___"]');
+    if (!row) return "";
+    const img = row.querySelector('img[src*="logos/"]');
+    const m = img && (img.getAttribute("src") || "").match(/logos\/([A-Za-z]{2,4})\./);
+    if (m) return m[1].toUpperCase();
+    const t = row.querySelector("[data-acronym]");
+    return t ? String(t.getAttribute("data-acronym")).toUpperCase() : "";
+  }
+  function sideOf(input) {
+    let el = input.parentElement;
+    for (let i = 0; i < 6 && el; i++, el = el.parentElement) {
+      const btn = [...el.querySelectorAll("button")].find((b) => /^(buy|sell)$/i.test((b.textContent || "").trim()));
+      if (btn) return btn.textContent.trim().toLowerCase();
+    }
+    return "";
+  }
+  function fillChoices(acr, side) {
+    const st = stockByAcr(acr);
+    const px = livePrice(acr);
+    const out = [];
+    if (!px) return out;
+    const have = st ? owned(st.id) : 0;
+    const held = st ? blocksHeld(have, st.req) : 0;
+    if (side !== "sell") {
+      const planSh = Math.floor(S.planAmt / px);
+      if (planSh > 0) out.push([`Plan ${money(S.planAmt)}`, planSh]);
+      if (st && st.req) {
+        const next = st.type === "passive" ? (held ? 0 : st.req - have) : sharesFor(st.req, held + 1) - have;
+        if (next > 0) out.push([st.type === "passive" ? "For the perk" : `For block ${held + 1}`, next]);
+      }
+    }
+    if (side !== "buy" && have) {
+      const keep = st ? (st.type === "passive" ? (held ? st.req : 0) : sharesFor(st.req, held)) : 0;
+      if (have - keep > 0) out.push([held ? "All but blocks" : "All", have - keep]);
+    }
+    return out;
+  }
+  function setReactValue(input, v) {
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
+    setter.call(input, String(v));
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+  function scanStockPage() {
+    const inputs = document.querySelectorAll('input.input-money:not([type="hidden"]), input[data-testid="legacy-money-input"]:not([type="hidden"])');
+    for (const input of inputs) {
+      if (input.closest(".tsg-fill")) continue;
+      const box = input.parentElement && input.parentElement.parentElement ? input.parentElement.parentElement : input.parentElement;
+      if (!box || box.querySelector(":scope > .tsg-fill") || (box.nextElementSibling && box.nextElementSibling.classList.contains("tsg-fill"))) continue;
+      const acr = acrFromRow(input);
+      if (!acr) continue;
+      const side = sideOf(input);
+      const choices = fillChoices(acr, side);
+      if (!choices.length) continue;
+      const row = document.createElement("div");
+      row.className = "tsg-fill";
+      row.style.cssText = "display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:6px 0;font:12px Arial,sans-serif;color:#9aa3ad";
+      row.innerHTML = `<span>📈 Fill shares:</span>` + choices.map(([l, n]) => `<button type="button" data-n="${n}" style="border:1px solid #74c0fc;background:transparent;color:#74c0fc;border-radius:8px;padding:3px 8px;font:12px Arial,sans-serif;cursor:pointer">${esc(l)}: ${commas(n)}</button>`).join("");
+      row.addEventListener("click", (e) => {
+        const b = e.target.closest("button[data-n]");
+        if (!b) return;
+        e.preventDefault();
+        e.stopPropagation();
+        // Torn re-renders its box often, so find the live one again.
+        const live = (row.parentElement && row.parentElement.querySelector('input.input-money:not([type="hidden"]), input[data-testid="legacy-money-input"]:not([type="hidden"])')) || input;
+        setReactValue(live, b.dataset.n);
+        live.focus();
+      });
+      box.parentNode.insertBefore(row, box.nextSibling);
+    }
+  }
+  function stockPageHelper() {
+    if (!isStocksPage()) return;
+    if (apiKey()) loadAll(false).then(scanStockPage);
+    else loadLive().then(scanStockPage);
+    let t = 0;
+    new MutationObserver(() => {
+      clearTimeout(t);
+      t = setTimeout(scanStockPage, 300);
+    }).observe(document.body, { childList: true, subtree: true });
+  }
+
   // ---------------------------------------------------------------- formatting
   const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
   const commas = (n) => Math.round(n).toLocaleString("en-US");
@@ -819,7 +1030,8 @@
   host.id = "torn-stock-geek";
   const root = host.attachShadow({ mode: "open" });
   root.innerHTML = `<style>${CSS()}</style>
-    <button class="fab" data-act="toggle" title="Torn Stock Geek (drag to move)"><span>📈</span></button>
+    <button class="fab" data-act="toggle" title="Torn Stock Geek (drag to move)"><span>📈</span><span class="fab-badge" hidden></span></button>
+    <div class="banner" hidden role="alert" data-act="banner"></div>
     <div class="scrim" data-act="close" hidden></div>
     <section class="panel" hidden role="dialog" aria-label="Torn Stock Geek">
       <header class="top">
@@ -847,6 +1059,11 @@
   let autoT = 0;
   let loading = false;
   function open() {
+    if (S.inbox.some((x) => !x.seen)) {
+      S.inbox.forEach((x) => (x.seen = true));
+      save();
+      badge();
+    }
     $(".panel").hidden = false;
     $(".scrim").hidden = false;
     render();
@@ -1020,6 +1237,7 @@
         <label class="field">How much cash do you want to invest?
           <input class="budget" inputmode="decimal" placeholder="e.g. 500m or 2.5b" value="${S.budget ? esc(money(S.budget).replace("$", "")) : ""}" autocomplete="off"></label>
         <div class="plan"></div>
+        ${vaultHtml()}
         ${foot()}`;
       const inp = $(".budget");
       inp.addEventListener("input", () => {
@@ -1029,6 +1247,30 @@
       });
       renderPlan();
     });
+  }
+
+  // Where to park cash so it can't be mugged: the calmest stocks lately.
+  function vaultHtml() {
+    const acrs = (data.market || []).map((s) => s.acr);
+    acrs.forEach((a) => {
+      if (!data.daily[a]) {
+        const c = store.get("d_" + a, null);
+        if (c) data.daily[a] = c;
+      }
+    });
+    const vols = acrs.map((a) => ({ a, v: dailyVol(a), s: stockByAcr(a) })).filter((x) => x.v != null);
+    const have = vols.length;
+    const calm = vols
+      .sort((x, y) => x.v - y.v)
+      .slice(0, 5);
+    const amt = S.budget || 1e9;
+    return `<h3>🛡 Park cash safely</h3>
+      <p class="muted small">Cash in hand can be mugged; shares can't. Selling takes seconds and costs 0.1% (${money(amt * SELL_FEE)} on ${money(amt)}). Calm stocks move least while your money sits there:</p>
+      ${calm.length < 5 || have < acrs.length * 0.8 ? `<button class="btn ghost" data-act="loadhist">Load price history for all stocks</button>` : ""}
+      ${calm.length ? `<div class="list">${calm.map((x) => `<button class="row" data-act="stock" data-acr="${esc(x.a)}"><span class="nm"><b>${esc(x.a)}</b><small>${esc(x.s ? x.s.name : "")}</small></span>
+          <span class="mid small muted">typical day ±${pctTxt(x.v, 2)} · a bad week about ${pctTxt(-x.v * Math.sqrt(5) * 2, 1)}</span></button>`).join("")}</div>`
+        : ""}
+      <p class="muted small">Tip: parking in a stock you're building a block in does two jobs at once.</p>`;
   }
 
   function renderPlan() {
@@ -1161,6 +1403,8 @@
         ${g.rec ? `<div class="line small muted">Last year with this rule: ${signPct(g.rec.ret)} vs ${signPct(g.rec.hold)} just holding · ${g.rec.trades} trades, ${g.rec.wins} won${g.rec.trades ? `, worst ${signPct(g.rec.worst)}` : ""}.</div>` : ""}
       </div>
       ${g.flow7 != null ? `<div class="line muted small flow">Players ${g.flow7 >= 0 ? "bought" : "sold"} ${pctTxt(Math.abs(g.flow7), 2)} of all shares this week${Math.abs(g.flow7) < 0.002 ? " (quiet)" : ""}.</div>` : ""}
+      ${planCard(acr)}
+      ${alertCard(acr)}
       ${scoreCardHtml(acr)}
       ${practiceCard(acr)}
       ${s ? stockBlockInfo(s, have, held) : ""}
@@ -1168,6 +1412,53 @@
       ${foot()}`;
     drawChart(acr);
     drawDayTrade(acr);
+    const pa = $(".plan-amt");
+    if (pa)
+      pa.addEventListener("input", () => {
+        const v = parseMoney(pa.value);
+        if (v > 0) {
+          S.planAmt = v;
+          save();
+          $(".plan-out").innerHTML = planOut(acr);
+        }
+      });
+  }
+
+  function planCard(acr) {
+    return `<div class="card">
+      <b>📝 Swing trade plan</b>
+      <label class="tog"><span>Money to use</span><input class="plan-amt" inputmode="decimal" value="${esc(money(S.planAmt).replace("$", ""))}" autocomplete="off" style="width:120px"></label>
+      <div class="plan-out">${planOut(acr)}</div>
+    </div>`;
+  }
+
+  function planOut(acr) {
+    const t = tradePlan(acr, S.planAmt);
+    if (!t) return `<div class="line muted">Needs price history; loading…</div>`;
+    if (!t.sh) return `<div class="line muted">That's less than one share.</div>`;
+    const wait = t.g.zone !== "buy";
+    return `
+      <div class="line">Buy <b>${commas(t.sh)}</b> shares at about ${price(t.g.price)} = ${money(t.cost)}${wait ? ` <span class="a">(not in the buy zone now: swing buyers wait for ${price(t.g.lo + (t.g.hi - t.g.lo) * SWING_LO)})</span>` : ""}</div>
+      <div class="line">🎯 Target (sell zone): <b>${price(t.target)}</b> → <span class="${t.win >= 0 ? "g" : "r"}">${t.win >= 0 ? "+" : ""}${money(t.win)}</span></div>
+      <div class="line">🛑 Stop-loss: <b>${price(t.stop)}</b> → <span class="r">${money(t.loss)}</span> <span class="muted small">(2 typical daily moves under the 20-day low)</span></div>
+      <div class="line muted">Break-even after the fee: ${price(t.be)} · ${t.ratio ? `you risk $1 to make $${t.ratio.toFixed(1)}` : ""}</div>
+      <div class="pbuy">
+        <button class="btn ghost" data-act="planalerts" data-acr="${esc(acr)}">🔔 Alert me at target & stop</button>
+        <button class="btn ghost" data-act="copy" data-n="${t.sh}">Copy ${shares(t.sh)}</button>
+      </div>
+      ${isStocksPage() ? `<div class="line small muted">On this page: open ${esc(acr)}'s BUY panel and tap “📈 Fill shares” under Torn's box.</div>` : ""}`;
+  }
+
+  function alertCard(acr) {
+    const a = S.alerts[acr] || {};
+    return `<div class="card">
+      <div class="crow"><b class="grow">🔔 Alerts for ${esc(acr)}</b>${a.above || a.below || a.zone ? `<button class="link" data-act="aclear" data-acr="${esc(acr)}">remove</button>` : ""}</div>
+      <div class="arow"><label>Above $<input class="al-above" inputmode="decimal" value="${a.above || ""}" placeholder="price"></label>
+        <label>Below $<input class="al-below" inputmode="decimal" value="${a.below || ""}" placeholder="price"></label></div>
+      <label class="tog small"><input type="checkbox" class="al-zone" ${a.zone ? "checked" : ""} style="width:auto"> <span>When it enters the swing buy or sell zone</span></label>
+      <div class="pbuy"><button class="btn" data-act="asave" data-acr="${esc(acr)}">Save alert</button>
+        <span class="muted small">Works while a Torn page is open${S.alertsOn ? "" : " · alerts are off in ⚙"}.</span></div>
+    </div>`;
   }
 
   function scoreCardHtml(acr) {
@@ -1411,6 +1702,13 @@
       <p class="muted small">Now using: <b>${b.apr ? `${b.apr}%/yr` : "not set"}</b>${b.src ? ` (${esc(b.src)})` : ""}. Blocks that pay less are marked red.</p>
       <h3>Your values</h3>
       ${Object.keys(S.custom).length ? `<div class="cards">${Object.entries(S.custom).map(([a, v]) => `<div class="card crow"><b class="grow">${esc(a)}</b> ${money(v)} <button class="link" data-act="clearval" data-acr="${esc(a)}">Remove</button></div>`).join("")}</div>` : `<p class="muted small">None yet. Set them with "Set value" on the Advisor tab.</p>`}
+      <h3>Alerts</h3>
+      <label class="tog"><span>Alerts on</span><input type="checkbox" class="set-alerts" ${S.alertsOn ? "checked" : ""} style="width:auto"></label>
+      <label class="tog"><span>Vibrate</span><input type="checkbox" class="set-vibrate" ${S.vibrate ? "checked" : ""} style="width:auto"></label>
+      <label class="tog"><span>Payout ready to collect (Limited key)</span><input type="checkbox" class="set-payout" ${S.payoutAlert ? "checked" : ""} style="width:auto"></label>
+      <p class="muted small">Alerts are checked once a minute while any Torn page is open (Torn PDA or browser). They can't reach you when Torn is closed. For alerts with the app closed, Torn PDA has its own stock alerts.</p>
+      ${alertCount() ? `<div class="cards">${Object.entries(S.alerts).map(([a, x]) => `<div class="card crow"><span class="grow">${stockLink(a, `<b>${esc(a)}</b>`)} ${[x.above ? `above ${price(x.above)}` : "", x.below ? `below ${price(x.below)}` : "", x.zone ? "swing zones" : ""].filter(Boolean).join(" · ")}</span><button class="link" data-act="aclear" data-acr="${esc(a)}">Remove</button></div>`).join("")}</div>` : `<p class="muted small">No alerts set. Add them on any stock's page.</p>`}
+      ${S.inbox.length ? `<p class="small"><b>Recent:</b></p><div class="log">${S.inbox.slice(0, 8).map((x) => `<div class="small"><span class="muted">${new Date(x.t).toISOString().slice(5, 16).replace("T", " ")}</span> ${esc(x.text)}</div>`).join("")}</div>` : ""}
       <h3>About</h3>
       <div class="about">
         <div><b>Torn Stock Geek v${VERSION}</b></div>
@@ -1434,6 +1732,14 @@
       toast(S.bankApr ? `Bank rate ${S.bankApr}%` : "Using Torn's bank rate");
       renderSettings();
     });
+    const tog = (cls, key) =>
+      $(cls).addEventListener("change", (e) => {
+        S[key] = e.target.checked;
+        save();
+      });
+    tog(".set-alerts", "alertsOn");
+    tog(".set-vibrate", "vibrate");
+    tog(".set-payout", "payoutAlert");
     $(".set-merits").addEventListener("change", (e) => {
       S.merits = Math.max(0, Math.min(10, parseInt(e.target.value, 10) || 0));
       save();
@@ -1509,7 +1815,51 @@
       $$("[data-act=range]").forEach((x) => x.classList.toggle("on", x.dataset.r === S.range));
       drawChart(view.acr);
     } else if (act === "practice") go("practice");
-    else if (act === "pbuy") {
+    else if (act === "asave") {
+      const acr = b.dataset.acr;
+      const above = parseFloat(($(".al-above") || {}).value) || 0;
+      const below = parseFloat(($(".al-below") || {}).value) || 0;
+      const zone = !!($(".al-zone") || {}).checked;
+      if (!above && !below && !zone) {
+        delete S.alerts[acr];
+        toast("Alert removed");
+      } else {
+        S.alerts[acr] = { above, below, zone, last: signal(acr).zone || "" };
+        toast(`Alert saved for ${acr}`);
+      }
+      save();
+      render();
+    } else if (act === "aclear") {
+      delete S.alerts[b.dataset.acr];
+      save();
+      render();
+    } else if (act === "planalerts") {
+      const acr = b.dataset.acr;
+      const t = tradePlan(acr, S.planAmt);
+      if (!t) return;
+      S.alerts[acr] = Object.assign({}, S.alerts[acr], { above: +t.target.toFixed(2), below: +t.stop.toFixed(2) });
+      save();
+      toast(`Alerts set: above ${price(t.target)}, below ${price(t.stop)}`, "", 3000);
+      render();
+    } else if (act === "copy") {
+      const n = b.dataset.n;
+      (navigator.clipboard ? navigator.clipboard.writeText(n) : Promise.reject()).then(
+        () => toast(`Copied ${commas(n)}`),
+        () => toast(`Shares: ${commas(n)}`, "", 4000)
+      );
+    } else if (act === "loadhist") {
+      b.disabled = true;
+      b.textContent = "Loading…";
+      (data.live ? Promise.resolve() : loadLive()).then(() => loadAllDaily()).then(() => render());
+    } else if (act === "bannerclose") {
+      e.stopPropagation();
+      $(".banner").hidden = true;
+    } else if (act === "banner") {
+      $(".banner").hidden = true;
+      view.acr = b.dataset.acr;
+      if (!isOpen()) open();
+      go("stock");
+    } else if (act === "pbuy") {
       const amt = parseMoney(($(".pamt") || {}).value);
       if (!amt) return toast("Type an amount first, e.g. 100m", "bad");
       toast(paperBuy(b.dataset.acr, amt), "", 3000);
@@ -1586,6 +1936,15 @@ button { font: inherit; cursor: pointer; }
   display: flex; align-items: center; justify-content: center; font-size: 24px; -webkit-tap-highlight-color: transparent;
   touch-action: none; user-select: none; -webkit-user-select: none; }
 .fab:active { transform: scale(.95); }
+.fab-badge { position: absolute; top: -5px; right: -5px; min-width: 20px; padding: 2px 5px; border-radius: 10px; font-size: 11px; font-weight: 700; background: var(--amber); color: #2b2200; }
+.banner { position: fixed; left: 10px; right: 10px; top: 10px; z-index: 2147483004; display: flex; align-items: center; gap: 8px; background: var(--bg3); color: var(--text);
+  border: 1px solid var(--amber); border-radius: 12px; padding: 10px 12px; font-size: 14px; box-shadow: 0 6px 20px rgba(0,0,0,.5); cursor: pointer; }
+.banner span { flex: 1; }
+@media (min-width: 760px) { .banner { left: auto; width: 420px; } }
+.ib.sm { min-width: 28px; height: 28px; font-size: 13px; padding: 0 6px; }
+.arow { display: flex; gap: 8px; }
+.arow label { flex: 1; display: flex; align-items: center; gap: 4px; font-size: 13px; color: var(--muted); }
+.arow input { padding: 7px 8px; }
 .scrim { position: fixed; inset: 0; z-index: 2147483001; background: rgba(0,0,0,.45); }
 .panel { position: fixed; z-index: 2147483002; left: 0; right: 0; bottom: 0; height: 88vh; height: 88dvh;
   background: var(--bg); color: var(--text); border-radius: 16px 16px 0 0; border: 1px solid var(--line);
@@ -1704,6 +2063,10 @@ input.num { width: 90px; }
     if (!document.body) return setTimeout(start, 200);
     document.body.appendChild(host);
     fabSetup();
+    badge();
+    stockPageHelper();
+    setTimeout(monitor, 4000);
+    setInterval(monitor, MON_EVERY);
   }
   start();
 })();
