@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Stock Geek
 // @namespace    https://github.com/SarcasticGeekJr/torn-stock-geek
-// @version      0.7.1
+// @version      0.8.0
 // @description  A stock advisor for Torn: compares what your money would earn in the bank, blocks, swing trading or holding; ranks the next benefit block of every stock by yearly return, plans what to buy with your cash, compares with your bank rate, tracks your portfolio, shows price charts with swing-trading signals, tests trading methods on each stock's real prices, has a practice account, price and payout alerts, a trade plan, and a fill-amount helper on the stock page. Built for Torn PDA, works in Tampermonkey too.
 // @author       SarcasticGeekJr
 // @match        https://www.torn.com/*
@@ -44,7 +44,7 @@
 
   // ---------------------------------------------------------------- config
   const PDA_KEY = "###PDA-APIKEY###"; // Torn PDA replaces this with your key at runtime
-  const VERSION = "0.7.1"; // keep in sync with @version above
+  const VERSION = "0.8.0"; // keep in sync with @version above
   const UPDATE_URL = "https://raw.githubusercontent.com/SarcasticGeekJr/torn-stock-geek/main/torn-stock-geek.user.js";
   const TORN = "https://api.torn.com";
   const TORNSY = "https://tornsy.com/api";
@@ -1117,16 +1117,25 @@
     }
     return "";
   }
+  // "Buy on Torn" remembers what you planned, so the stock page can point at it. It expires after 15 minutes.
+  const INTENT_TTL = 15 * MIN;
+  function buyIntent() {
+    const i = store.get("buyIntent", null);
+    return i && Date.now() - i.t < INTENT_TTL ? i : null;
+  }
+
   function fillChoices(acr, side) {
     const st = stockByAcr(acr);
     const px = livePrice(acr);
     const out = [];
+    const intent = buyIntent();
+    if (intent && intent.acr === acr && side !== "sell") out.push(["🛒 Your plan", intent.n, true]);
     if (!px) return out;
     const have = st ? owned(st.id) : 0;
     const held = st ? blocksHeld(have, st.req) : 0;
     if (side !== "sell") {
       const planSh = Math.floor(S.planAmt / px);
-      if (planSh > 0) out.push([`Plan ${money(S.planAmt)}`, planSh]);
+      if (planSh > 0 && !(intent && intent.acr === acr && intent.n === planSh)) out.push([`Plan ${money(S.planAmt)}`, planSh]);
       if (st && st.req) {
         const next = st.type === "passive" ? (held ? 0 : st.req - have) : sharesFor(st.req, held + 1) - have;
         if (next > 0) out.push([st.type === "passive" ? "For the perk" : `For block ${held + 1}`, next]);
@@ -1158,7 +1167,15 @@
       const row = document.createElement("div");
       row.className = "tsg-fill";
       row.style.cssText = "display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:6px 0;font:12px Arial,sans-serif;color:#9aa3ad";
-      row.innerHTML = `<span>📈 Fill shares:</span>` + choices.map(([l, n]) => `<button type="button" data-n="${n}" style="border:1px solid #74c0fc;background:transparent;color:#74c0fc;border-radius:8px;padding:3px 8px;font:12px Arial,sans-serif;cursor:pointer">${esc(l)}: ${commas(n)}</button>`).join("");
+      row.innerHTML =
+        `<span>📈 Fill shares:</span>` +
+        choices
+          .map(([l, n, big]) =>
+            big
+              ? `<button type="button" data-n="${n}" data-plan="1" style="border:0;background:#7fdc6f;color:#0b260f;border-radius:9px;padding:8px 12px;font:bold 14px Arial,sans-serif;cursor:pointer">${esc(l)}: Fill ${commas(n)} shares</button>`
+              : `<button type="button" data-n="${n}" style="border:1px solid #74c0fc;background:transparent;color:#74c0fc;border-radius:8px;padding:3px 8px;font:12px Arial,sans-serif;cursor:pointer">${esc(l)}: ${commas(n)}</button>`
+          )
+          .join("");
       row.addEventListener("click", (e) => {
         const b = e.target.closest("button[data-n]");
         if (!b) return;
@@ -1168,12 +1185,41 @@
         const live = (row.parentElement && row.parentElement.querySelector('input.input-money:not([type="hidden"]), input[data-testid="legacy-money-input"]:not([type="hidden"])')) || input;
         setReactValue(live, b.dataset.n);
         live.focus();
+        if (b.dataset.plan) {
+          store.set("buyIntent", null);
+          document.querySelectorAll(".tsg-guide").forEach((g) => (g.textContent = "✓ Filled. Now press Torn's BUY and confirm."));
+        }
       });
       box.parentNode.insertBefore(row, box.nextSibling);
     }
   }
+  // Scrolls to the stock you chose with "Buy on Torn", outlines it and says what to tap next.
+  function highlightIntent() {
+    const intent = buyIntent();
+    if (!intent) return;
+    let tries = 0;
+    const timer = setInterval(() => {
+      const row = [...document.querySelectorAll('ul[class*="stock___"]')].find((u) => acrFromRow(u) === intent.acr);
+      if (!row && ++tries < 40) return;
+      clearInterval(timer);
+      if (!row) return;
+      row.style.outline = "3px solid #7fdc6f";
+      row.style.outlineOffset = "2px";
+      row.style.borderRadius = "6px";
+      if (!row.parentNode.querySelector(".tsg-guide")) {
+        const g = document.createElement("div");
+        g.className = "tsg-guide";
+        g.style.cssText = "margin:6px 0;padding:8px 10px;border-radius:8px;background:#26292d;color:#e9ecef;border:1px solid #7fdc6f;font:13px Arial,sans-serif";
+        g.textContent = `🛒 Torn Stock Geek: open ${intent.acr}'s BUY panel, then tap the green “Your plan: Fill ${commas(intent.n)} shares” under Torn's box. You press BUY and confirm.`;
+        row.parentNode.insertBefore(g, row);
+      }
+      row.scrollIntoView({ behavior: "smooth", block: "center" });
+    }, 500);
+  }
+
   function stockPageHelper() {
     if (!isStocksPage()) return;
+    highlightIntent();
     if (apiKey()) loadAll(false).then(scanStockPage);
     else loadLive().then(scanStockPage);
     let t = 0;
@@ -1520,6 +1566,7 @@
           <b class="${o.gain > 0 ? "g" : o.gain < 0 ? "r" : ""}">${o.gain >= 0 ? "+" : ""}${money(o.gain)}</b></div>
         <div class="line small muted">${o.sub}${o.acr ? ` ${stockLink(o.acr, "chart ›")}` : ""}</div>
         ${o.lo != null ? `<div class="line small muted">${o.rangeLabel}: ${o.lo >= 0 ? "+" : ""}${money(o.lo)} to ${o.hi >= 0 ? "+" : ""}${money(o.hi)} (typical ${o.gain >= 0 ? "+" : ""}${money(o.gain)}) <span class="a">⚠ can lose</span></div>` : ""}
+        ${o.key === "swing" && livePrice(o.acr) ? `<button class="btn small" data-act="buytorn" data-acr="${esc(o.acr)}" data-n="${Math.floor(A / livePrice(o.acr))}">🛒 Buy ${shares(Math.floor(A / livePrice(o.acr)))} ${esc(o.acr)} on Torn</button>` : ""}
         ${o.key === "swing" ? (S.alerts[o.acr] && S.alerts[o.acr].zone ? `<div class="line small g">🔔 Reminder on for ${esc(o.acr)}'s buy & sell zone ✓</div>` : `<button class="btn ghost small" data-act="zonealert" data-acr="${esc(o.acr)}">🔔 Remind me at buy & sell zone</button>`) : ""}
         ${o.more || ""}</div>`;
     box.innerHTML = `
@@ -1682,6 +1729,7 @@
       <div class="line muted">Break-even after the fee: ${price(t.be)} · ${t.ratio ? `you risk $1 to make $${t.ratio.toFixed(1)}` : ""}</div>
       <div class="pbuy">
         <button class="btn ghost" data-act="planalerts" data-acr="${esc(acr)}">🔔 Alert me at target & stop</button>
+        <button class="btn" data-act="buytorn" data-acr="${esc(acr)}" data-n="${t.sh}">🛒 Buy on Torn</button>
         <button class="btn ghost" data-act="copy" data-n="${t.sh}">Copy ${shares(t.sh)}</button>
       </div>
       ${isStocksPage() ? `<div class="line small muted">On this page: open ${esc(acr)}'s BUY panel and tap “📈 Fill shares” under Torn's box.</div>` : ""}`;
@@ -2096,6 +2144,16 @@
       save();
       toast(`Alerts set: above ${price(t.target)}, below ${price(t.stop)}`, "", 3000);
       render();
+    } else if (act === "buytorn") {
+      store.set("buyIntent", { acr: b.dataset.acr, n: +b.dataset.n, t: Date.now() });
+      if (isStocksPage()) {
+        close();
+        highlightIntent();
+        scanStockPage();
+      } else {
+        toast("Opening the stock market…");
+        location.href = STOCKS_PAGE;
+      }
     } else if (act === "copy") {
       const n = b.dataset.n;
       (navigator.clipboard ? navigator.clipboard.writeText(n) : Promise.reject()).then(

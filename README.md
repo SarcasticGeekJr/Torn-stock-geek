@@ -58,6 +58,7 @@ Tap the 📈 button (you can drag it).
 
 **📈 Fill shares (on Torn's stock market page)**
 - Open a stock's BUY or SELL panel: under Torn's shares box you get buttons like "Plan $100m: 114,429", "For block 2: 1,000,000" or "All but blocks: 100,000". Tapping one only types the number. You still press BUY/SELL and confirm.
+- **🛒 Buy on Torn** (on the Money tab's swing option and each stock's trade plan): opens the stock market, scrolls to that stock and outlines it, and puts a green **"Your plan: Fill 307,512 shares"** button under Torn's box. Tap it, then press Torn's BUY and confirm. The script never presses BUY; Torn has no "buy at a set price" orders, so you buy at that minute's price.
 
 **🛡 Park cash safely** (Money tab)
 - The calmest stocks lately, for keeping cash where it can't be mugged (selling costs 0.1%).
