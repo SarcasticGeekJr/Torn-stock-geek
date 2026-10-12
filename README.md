@@ -34,8 +34,8 @@ Tap the 📈 button (you can drag it).
 - It shows what your **whole amount** would earn in each option, with the **best one on top**:
   - 🏦 Bank: Torn's real rate (with your merits and TCI), using the best term for the period.
   - 🎯 Benefit blocks: only when they beat the bank (the rest goes to the bank). Shows exactly what to buy.
-  - 📈 Swing trade: the best stock in the buy zone now, with the typical result (and range) from similar starts last year.
-  - 📊 Just holding a stock: the typical result and range.
+  - 📈 Swing trade: the best stock in the buy zone now: the price to buy at, the price to sell at, the profit it made last year in similar cases, and a **🔔 Remind me at buy & sell zone** button.
+  - 📊 Just holding a stock: the profit or loss it made last year.
   - ✖ Day trading: ≈ $0, because Torn prices move less in an hour than the 0.1% fee.
 - It never splits your money unless the split really earns more (a block that beats the bank, or money over the bank's $2b limit).
 - If you can't afford a good block yet, it shows the cheapest one and how much more you need.
@@ -51,6 +51,7 @@ Tap the 📈 button (you can drag it).
 
 **🔔 Alerts**
 - Per stock: price above / below, or when it enters the swing buy or sell zone.
+- Zone reminders come with a one-line warning in prices, from that stock's last year, e.g. "It could still drop: last year it usually went down to about $323.68 (lowest $314.60) before bouncing." The same line shows on the stock's page.
 - Benefit payout ready to collect (Limited key).
 - A banner on any Torn page, a badge on the 📈 button, and a vibration. Checked once a minute **while a Torn page is open**; they can't reach you when Torn is closed.
 

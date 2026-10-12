@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Stock Geek
 // @namespace    https://github.com/SarcasticGeekJr/torn-stock-geek
-// @version      0.5.0
+// @version      0.6.0
 // @description  A stock advisor for Torn: compares what your money would earn in the bank, blocks, swing trading or holding; ranks the next benefit block of every stock by yearly return, plans what to buy with your cash, compares with your bank rate, tracks your portfolio, shows price charts with swing-trading signals, tests trading methods on each stock's real prices, has a practice account, price and payout alerts, a trade plan, and a fill-amount helper on the stock page. Built for Torn PDA, works in Tampermonkey too.
 // @author       SarcasticGeekJr
 // @match        https://www.torn.com/*
@@ -42,7 +42,7 @@
 
   // ---------------------------------------------------------------- config
   const PDA_KEY = "###PDA-APIKEY###"; // Torn PDA replaces this with your key at runtime
-  const VERSION = "0.5.0"; // keep in sync with @version above
+  const VERSION = "0.6.0"; // keep in sync with @version above
   const UPDATE_URL = "https://raw.githubusercontent.com/SarcasticGeekJr/torn-stock-geek/main/torn-stock-geek.user.js";
   const TORN = "https://api.torn.com";
   const TORNSY = "https://tornsy.com/api";
@@ -656,10 +656,47 @@
     return out;
   }
 
+  // How far the price usually kept going after entering a zone last year, before turning around.
+  // Buy zone: the lowest close before it reached the sell zone (or 30 days). Sell zone: the highest close.
+  const overMemo = new Map(); // acr|zone|history time -> result
+  function overshoot(acr, zone) {
+    const dd = data.daily[acr];
+    if (!dd || dd.close.length < SWING_N + 60) return null;
+    const key = `${acr}|${zone}|${dd.t}`;
+    if (overMemo.has(key)) return overMemo.get(key);
+    const x = dd.close;
+    const sig = swingSignals(x);
+    const other = zone === "buy" ? "sell" : "buy";
+    const moves = [];
+    for (let i = Math.max(SWING_N + 1, x.length - 365); i < x.length - 1; i++) {
+      if (sig[i] !== zone || sig[i - 1] === zone) continue; // the day it entered the zone
+      let ext = x[i];
+      for (let j = i + 1; j < Math.min(x.length, i + 31) && sig[j] !== other; j++) ext = zone === "buy" ? Math.min(ext, x[j]) : Math.max(ext, x[j]);
+      moves.push(ext / x[i] - 1);
+    }
+    const res = moves.length >= 3 ? { usual: pctl(moves, 0.5), worst: zone === "buy" ? Math.min(...moves) : Math.max(...moves), n: moves.length } : null;
+    overMemo.set(key, res);
+    return res;
+  }
+  // One line: where the price could still go from here, in prices.
+  function overshootLine(acr, zone, px) {
+    const o = overshoot(acr, zone);
+    if (!o || !px) return "";
+    return zone === "buy"
+      ? `It could still drop: last year it usually went down to about ${price(px * (1 + o.usual))} (lowest ${price(px * (1 + o.worst))}) before bouncing.`
+      : `It could still rise: last year it usually went up to about ${price(px * (1 + o.usual))} (highest ${price(px * (1 + o.worst))}) before falling.`;
+  }
+
   function verdict(g) {
     if (g.zone == null) return { cls: "even", icon: "⚪", short: "no data", text: "Price history isn't loaded yet." };
     const rec = g.rec;
     const record = rec && rec.trades ? `This rule won ${rec.wins} of ${rec.trades} trades on ${g.acr} in the last year.` : "";
+    const warn = g.zone === "buy" || g.zone === "sell" ? overshootLine(g.acr, g.zone, g.price) : "";
+    const v = verdictBase(g, record);
+    if (warn) v.warn = warn;
+    return v;
+  }
+  function verdictBase(g, record) {
     if (g.zone === "buy")
       return g.works
         ? { cls: "good", icon: "🟢", short: "buy zone", text: `Price is near its 20-day low (${price(g.lo)}). ${record}` }
@@ -976,8 +1013,8 @@
           else data.daily[acr] = c;
           const z = signal(acr).zone;
           if (z && z !== a.last) {
-            if (z === "buy") notify(acr, `${acr} entered the swing buy zone (${price(px)}).`);
-            if (z === "sell") notify(acr, `${acr} entered the swing sell zone (${price(px)}).`);
+            if (z === "buy") notify(acr, `${acr} entered the buy zone (${price(px)}). ${overshootLine(acr, "buy", px)}`.trim());
+            if (z === "sell") notify(acr, `${acr} entered the sell zone (${price(px)}). ${overshootLine(acr, "sell", px)}`.trim());
             a.last = z;
             changed = true;
           }
@@ -1419,21 +1456,23 @@
     }
     if (sw)
       opts.push({ key: "swing", gain: A * sw.mid, lo: A * sw.lo, hi: A * sw.hi, title: `📈 Swing trade ${esc(sw.acr)} (in the buy zone now)`,
-        sub: `typical result from ${sw.n} similar starts last year · can lose`, acr: sw.acr });
+        sub: `Buy at ${price(sw.g.lo + (sw.g.hi - sw.g.lo) * SWING_LO)} or lower · sell at about ${price(sw.g.lo + (sw.g.hi - sw.g.lo) * SWING_HI)}`,
+        rangeLabel: `Profit last year in ${sw.n} similar cases`, acr: sw.acr });
     if (hold.length)
-      opts.push({ key: "hold", gain: A * pctl(hold, 0.5), lo: A * pctl(hold, 0.1), hi: A * pctl(hold, 0.9), title: "📊 Just buy a stock and hold it", sub: `typical ${plabel} for any stock last year · can lose` });
+      opts.push({ key: "hold", gain: A * pctl(hold, 0.5), lo: A * pctl(hold, 0.1), hi: A * pctl(hold, 0.9), title: "📊 Just buy a stock and hold it", sub: `Any stock, held for ${plabel}`, rangeLabel: "Profit or loss last year" });
     opts.sort((a, b) => b.gain - a.gain);
     const best = opts[0];
     const short = !blocks || !blocks.p.picks.length ? cheapestGoodBlock(A) : null;
     const line = (o, isBest) => `<div class="opt ${isBest ? "best" : ""}">
         <div class="crow"><span class="grow">${isBest ? "✅ <b>Best:</b> " : ""}${o.title}</span>
           <b class="${o.gain > 0 ? "g" : o.gain < 0 ? "r" : ""}">${o.gain >= 0 ? "+" : ""}${money(o.gain)}</b></div>
-        <div class="line small muted">${o.sub}${o.lo != null ? ` · range ${o.lo >= 0 ? "+" : ""}${money(o.lo)} to ${o.hi >= 0 ? "+" : ""}${money(o.hi)}` : ""}${o.safe ? "" : " ⚠"}${o.acr ? ` ${stockLink(o.acr, "chart ›")}` : ""}</div>
+        <div class="line small muted">${o.sub}${o.acr ? ` ${stockLink(o.acr, "chart ›")}` : ""}</div>
+        ${o.lo != null ? `<div class="line small muted">${o.rangeLabel}: ${o.lo >= 0 ? "+" : ""}${money(o.lo)} to ${o.hi >= 0 ? "+" : ""}${money(o.hi)} (typical ${o.gain >= 0 ? "+" : ""}${money(o.gain)}) <span class="a">⚠ can lose</span></div>` : ""}
+        ${o.key === "swing" ? (S.alerts[o.acr] && S.alerts[o.acr].zone ? `<div class="line small g">🔔 Reminder on for ${esc(o.acr)}'s buy & sell zone ✓</div>` : `<button class="btn ghost small" data-act="zonealert" data-acr="${esc(o.acr)}">🔔 Remind me at buy & sell zone</button>`) : ""}
         ${o.more || ""}</div>`;
     box.innerHTML = `
       <p class="ptitle">${money(A)} over ${plabel}</p>
       ${best ? line(best, true) : `<p class="muted">No options yet.${data.bank || S.bankApr ? "" : " Set your bank rate in ⚙."}</p>`}
-      ${best && best.safe === undefined ? `<p class="small a">This best option can also lose money; the number is its typical result, not a promise.</p>` : ""}
       ${opts.length > 1 ? `<p class="small muted">Compared with (all ${money(A)} in each):</p>${opts.slice(1).map((o) => line(o, false)).join("")}` : ""}
       ${!sw && !loadingHist ? `<div class="opt"><div class="line small muted">📈 Swing trade: ${bestSwing.why === "history" ? `not enough price history to estimate ${plabel}; try a shorter period.` : "no stock is in the buy zone right now. Swing traders wait (the Trade tab shows when one gets there)."}</div></div>` : ""}
       ${loadingHist ? `<div class="opt"><div class="line small muted"><span class="spin">⟳</span> Loading price history for the swing and holding estimates…</div></div>` : ""}
@@ -1544,6 +1583,7 @@
       <div class="card sig ${v.cls}">
         <div class="crow"><b class="grow">${v.icon} Swing signal: ${esc(v.short)}</b></div>
         <div class="line">${esc(v.text)}</div>
+        ${v.warn ? `<div class="line a">⚠ ${esc(v.warn)}</div>` : ""}
         ${g.lo != null ? `<div class="line muted">20-day range: ${price(g.lo)} – ${price(g.hi)} · buy zone below ${price(g.lo + (g.hi - g.lo) * SWING_LO)} · sell zone above ${price(g.lo + (g.hi - g.lo) * SWING_HI)}</div>` : ""}
         ${have && g.zone === "sell" && free > 0 ? `<div class="line">You have <b>${commas(free)}</b> shares above your ${held ? "blocks" : "0 blocks"} that you could sell.</div>` : ""}
         ${g.rec ? `<div class="line small muted">Last year with this rule: ${signPct(g.rec.ret)} vs ${signPct(g.rec.hold)} just holding · ${g.rec.trades} trades, ${g.rec.wins} won${g.rec.trades ? `, worst ${signPct(g.rec.worst)}` : ""}.</div>` : ""}
@@ -2019,6 +2059,12 @@
       paper = paperNew(amt);
       savePaper();
       render();
+    } else if (act === "zonealert") {
+      const acr = b.dataset.acr;
+      S.alerts[acr] = Object.assign({ above: 0, below: 0 }, S.alerts[acr], { zone: true, last: signal(acr).zone || "" });
+      save();
+      toast(`You'll get a reminder when ${acr} enters the buy or sell zone (while Torn is open).`, "", 3500);
+      renderPlan();
     } else if (act === "period") {
       S.period = b.dataset.k;
       save();
@@ -2208,6 +2254,7 @@ input.num { width: 90px; }
 .opt.best { border-color: rgba(127,220,111,.6); background: rgba(127,220,111,.06); }
 .opt .crow b { font-size: 15px; white-space: nowrap; }
 .opt details.more summary { cursor: pointer; color: var(--acc); font-size: 13px; margin-top: 4px; }
+.btn.small { height: 30px; font-size: 13px; padding: 0 10px; margin-top: 6px; }
 .bar { height: 6px; border-radius: 3px; background: var(--bg3); margin-top: 6px; overflow: hidden; }
 .bar i { display: block; height: 100%; background: var(--acc); }
 .toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); z-index: 2147483003; background: var(--bg3); color: var(--text);
