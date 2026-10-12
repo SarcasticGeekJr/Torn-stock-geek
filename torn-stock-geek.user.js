@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Stock Geek
 // @namespace    https://github.com/SarcasticGeekJr/torn-stock-geek
-// @version      0.7.0
+// @version      0.7.1
 // @description  A stock advisor for Torn: compares what your money would earn in the bank, blocks, swing trading or holding; ranks the next benefit block of every stock by yearly return, plans what to buy with your cash, compares with your bank rate, tracks your portfolio, shows price charts with swing-trading signals, tests trading methods on each stock's real prices, has a practice account, price and payout alerts, a trade plan, and a fill-amount helper on the stock page. Built for Torn PDA, works in Tampermonkey too.
 // @author       SarcasticGeekJr
 // @match        https://www.torn.com/*
@@ -44,7 +44,7 @@
 
   // ---------------------------------------------------------------- config
   const PDA_KEY = "###PDA-APIKEY###"; // Torn PDA replaces this with your key at runtime
-  const VERSION = "0.7.0"; // keep in sync with @version above
+  const VERSION = "0.7.1"; // keep in sync with @version above
   const UPDATE_URL = "https://raw.githubusercontent.com/SarcasticGeekJr/torn-stock-geek/main/torn-stock-geek.user.js";
   const TORN = "https://api.torn.com";
   const TORNSY = "https://tornsy.com/api";
@@ -204,7 +204,12 @@
     if (opts.priority) headers.Priority = String(opts.priority);
     return httpPost(NTFY + S.ntfyTopic, text, headers).then(
       () => true,
-      (e) => (/429/.test(e.message) ? "busy" : false)
+      (e) => {
+        // ntfy limits how often one address can send; try an alert once more a minute later.
+        if (!/429/.test(e.message)) return false;
+        if (opts.retry !== false) setTimeout(() => sendNtfy(text, Object.assign({}, opts, { retry: false })), 65 * 1000);
+        return "busy";
+      }
     );
   }
 
@@ -2134,7 +2139,7 @@
       if (!ntfyTopicOk(t)) return toast("Tap New to make a topic first", "bad");
       S.ntfyTopic = t;
       save();
-      sendNtfy("Test from Torn Stock Geek. Alerts will arrive like this.", { tags: "white_check_mark" }).then((ok) =>
+      sendNtfy("Test from Torn Stock Geek. Alerts will arrive like this.", { tags: "white_check_mark", retry: false }).then((ok) =>
         toast(ok === true ? "Test sent. Check the ntfy app." : ok === "busy" ? "ntfy says too many messages; try again in a few minutes." : "Couldn't send. Check your connection.", ok === true ? "" : "bad", 3500)
       );
     } else if (act === "zonealert") {
