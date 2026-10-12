@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Torn Stock Geek
 // @namespace    https://github.com/SarcasticGeekJr/torn-stock-geek
-// @version      0.4.0
-// @description  A stock advisor for Torn: ranks the next benefit block of every stock by yearly return, plans what to buy with your cash, compares with your bank rate, tracks your portfolio, shows price charts with swing-trading signals, tests trading methods on each stock's real prices, has a practice account, price and payout alerts, a trade plan, and a fill-amount helper on the stock page. Built for Torn PDA, works in Tampermonkey too.
+// @version      0.5.0
+// @description  A stock advisor for Torn: compares what your money would earn in the bank, blocks, swing trading or holding; ranks the next benefit block of every stock by yearly return, plans what to buy with your cash, compares with your bank rate, tracks your portfolio, shows price charts with swing-trading signals, tests trading methods on each stock's real prices, has a practice account, price and payout alerts, a trade plan, and a fill-amount helper on the stock page. Built for Torn PDA, works in Tampermonkey too.
 // @author       SarcasticGeekJr
 // @match        https://www.torn.com/*
 // @grant        GM_xmlhttpRequest
@@ -26,7 +26,7 @@
  *     v1 /market/?selections=pointsmarket  points price, for payouts in points                   (Public key)
  *   Tornsy (https://tornsy.com/api, free, no key): price history of every stock, collected each minute.
  *     /stocks?interval=h24,d7              current prices plus 24h and 7d ago
- *     /{acronym}?interval=d1&limit=400     daily candles [time, open, high, low, close, total_shares]
+ *     /{acronym}?interval=d1&limit=760     daily candles [time, open, high, low, close, total_shares]
  *     /{acronym}?interval=h1&limit=1000    hourly candles, to test day trading
  *
  * Rules: this script only reads data and shows advice. It never buys or sells anything.
@@ -42,7 +42,7 @@
 
   // ---------------------------------------------------------------- config
   const PDA_KEY = "###PDA-APIKEY###"; // Torn PDA replaces this with your key at runtime
-  const VERSION = "0.4.0"; // keep in sync with @version above
+  const VERSION = "0.5.0"; // keep in sync with @version above
   const UPDATE_URL = "https://raw.githubusercontent.com/SarcasticGeekJr/torn-stock-geek/main/torn-stock-geek.user.js";
   const TORN = "https://api.torn.com";
   const TORNSY = "https://tornsy.com/api";
@@ -70,6 +70,7 @@
     bankApr: 0, // your own bank rate, % per year (0 = use Torn's rate)
     merits: 0, // Bank Interest merits, +5% each
     budget: 0, // planner cash
+    period: "3m", // money compare period
     tab: "advisor",
     tradeFilter: "all",
     tradeSort: "zone", // or "record"
@@ -393,7 +394,7 @@
     const c = store.get("d_" + acr, null);
     if (!force && c && Date.now() - c.t < DAILY_TTL) return (data.daily[acr] = c);
     try {
-      const d = await tornsy(`/${acr.toLowerCase()}?interval=d1&limit=400`, DAILY_TTL, force);
+      const d = await tornsy(`/${acr.toLowerCase()}?interval=d1&limit=760`, DAILY_TTL, force);
       const rows = (d.data || []).filter((r) => r && r.length >= 5);
       const today = Math.floor(Date.now() / DAY) * (DAY / 1000);
       const done = rows.filter((r) => +r[0] < today);
@@ -504,6 +505,24 @@
     return { apr: +(best.v * mult).toFixed(1), src: `Torn bank, ${best.label}` + (mult > 1 ? " with your bonuses" : "") };
   }
   const bankApr = () => bankRate().apr;
+
+  // What the bank pays on `amount` over `days`, re-investing each term. Uses the best term that fits the period.
+  const TERM_DAYS = { "1w": 7, "2w": 14, "1m": 30, "2m": 60, "3m": 90 };
+  function bankOver(amount, days) {
+    const put = Math.min(amount, BANK_LIMIT);
+    if (S.bankApr > 0) return { gain: put * (S.bankApr / 100) * (days / 365), apr: S.bankApr, term: "", put };
+    if (!data.bank) return null;
+    const mult = (1 + 0.05 * (S.merits || 0)) * (ownsTCI() ? 1.1 : 1);
+    let best = null;
+    for (const [k, label] of BANK_TERMS) {
+      const td = TERM_DAYS[k];
+      if (!data.bank[k] || (td > days && k !== "1w")) continue;
+      const apr = data.bank[k] * mult;
+      const gain = put * (Math.pow(1 + ((apr / 100) * td) / 365, Math.max(1, Math.floor(days / td))) - 1);
+      if (!best || gain > best.gain) best = { gain, apr: +apr.toFixed(1), term: label, put, times: Math.max(1, Math.floor(days / td)) };
+    }
+    return best;
+  }
 
   // ---------------------------------------------------------------- block maths
   // Block k (1-based) needs req × 2^(k-1) more shares, so holding n blocks takes req × (2^n − 1) shares.
@@ -785,6 +804,92 @@
     return `Sold ${commas(got / px / (1 - SELL_FEE))} ${acr} at ${price(px)}: ${pl >= 0 ? "profit" : "loss"} ${money(Math.abs(pl))} (practice).`;
   }
 
+  // ---------------------------------------------------------------- money compare
+  const PERIODS = [["1w", "1 week", 7], ["1m", "1 month", 30], ["3m", "3 months", 91], ["1y", "1 year", 365]];
+  const pctl = (arr, q) => {
+    const a = [...arr].sort((x, y) => x - y);
+    return a.length ? a[Math.min(a.length - 1, Math.max(0, Math.round(q * (a.length - 1))))] : 0;
+  };
+  // Swing-rule signal for every day: "buy" in the bottom 10% of the previous 20 days, "sell" in the top 10%.
+  function swingSignals(x) {
+    const out = new Array(x.length).fill(null);
+    for (let i = SWING_N; i < x.length; i++) out[i] = rangeRule(x, SWING_N)(i);
+    return out;
+  }
+  // What the swing rule made in every `days`-long stretch of the last year. `fromBuy` keeps only stretches that
+  // started in the buy zone, which is the situation you'd be in if you started today.
+  function swingStretches(acr, days, fromBuy) {
+    const dd = data.daily[acr];
+    if (!dd || dd.close.length < SWING_N + days + 30) return [];
+    const x = dd.close;
+    const sig = swingSignals(x);
+    const out = [];
+    for (let st = Math.max(SWING_N, x.length - 365 - days); st + days < x.length; st++) {
+      if (fromBuy && sig[st] !== "buy") continue;
+      let cash = 1, sh = 0;
+      for (let i = st; i <= st + days; i++) {
+        if (sig[i] === "buy" && !sh) {
+          sh = cash / x[i];
+          cash = 0;
+        } else if (sig[i] === "sell" && sh) {
+          cash = sh * x[i] * (1 - SELL_FEE);
+          sh = 0;
+        }
+      }
+      if (sh) cash = sh * x[st + days] * (1 - SELL_FEE);
+      out.push(cash - 1);
+    }
+    return out;
+  }
+  // Buy-and-hold over every `days`-long stretch of the last year, for every stock.
+  function holdStretches(days) {
+    const out = [];
+    for (const dd of Object.values(data.daily)) {
+      const x = dd && dd.close;
+      if (!x || x.length < days + 30) continue;
+      for (let st = Math.max(0, x.length - 365 - days); st + days < x.length; st += 2) out.push((x[st + days] * (1 - SELL_FEE)) / x[st] - 1);
+    }
+    return out;
+  }
+  // The best swing stock right now: in the buy zone, with the best typical result from that point.
+  function bestSwing(days) {
+    let best = null;
+    bestSwing.why = "zone";
+    for (const acr of Object.keys(data.daily)) {
+      const g = signal(acr);
+      if (g.zone !== "buy") continue;
+      bestSwing.why = "history";
+      let r = swingStretches(acr, days, true);
+      if (r.length < 5) r = swingStretches(acr, days, false);
+      if (r.length < 5) continue;
+      const c = { acr, mid: pctl(r, 0.5), lo: pctl(r, 0.1), hi: pctl(r, 0.9), n: r.length, g };
+      if (!best || c.mid > best.mid) best = c;
+    }
+    return best;
+  }
+  // Blocks worth more than the bank (plus any money over the bank's limit), and what they pay out within `days`.
+  function blocksOver(amount, days) {
+    if (!data.market) return null;
+    const p = plan(amount);
+    if (!p.picks.length) return { p, gain: 0 };
+    let pay = 0;
+    for (const x of p.picks) pay += x.s.type === "passive" ? (x.perYear * days) / 365 : Math.floor(days / x.s.freq) * x.pv.value;
+    const b = bankOver(p.left, days);
+    return { p, pay, bank: b, gain: pay + (b ? b.gain : 0) };
+  }
+  // The cheapest first block that beats the bank, for when you can't afford one yet.
+  function cheapestGoodBlock(amount) {
+    const bank = bankApr() / 100;
+    let best = null;
+    for (const st of data.market || []) {
+      if (!st.req || st.type === "passive" || blocksHeld(owned(st.id), st.req) > 0) continue;
+      const x = steps(st, 1)[0];
+      if (!x || !(x.roi > 0) || (bank && x.roi <= bank) || x.cost <= amount) continue;
+      if (!best || x.cost < best.cost) best = x;
+    }
+    return best;
+  }
+
   // ---------------------------------------------------------------- trade plan
   // Typical daily move (standard deviation of daily changes) over the last 60 days.
   function dailyVol(acr, n = 60) {
@@ -1043,7 +1148,7 @@
       </header>
       <nav class="tabs">
         <button class="tab" data-act="tab" data-tab="advisor">Advisor</button>
-        <button class="tab" data-act="tab" data-tab="planner">Planner</button>
+        <button class="tab" data-act="tab" data-tab="planner">Money</button>
         <button class="tab" data-act="tab" data-tab="trade">Trade</button>
         <button class="tab" data-act="tab" data-tab="portfolio">Mine</button>
       </nav>
@@ -1234,8 +1339,9 @@
   function renderPlanner() {
     loadingOr(() => {
       body().innerHTML = `${status()}
-        <label class="field">How much cash do you want to invest?
-          <input class="budget" inputmode="decimal" placeholder="e.g. 500m or 2.5b" value="${S.budget ? esc(money(S.budget).replace("$", "")) : ""}" autocomplete="off"></label>
+        <label class="field">💰 How much can you invest now?
+          <input class="budget" inputmode="decimal" placeholder="e.g. 20m or 2.5b" value="${S.budget ? esc(money(S.budget).replace("$", "")) : ""}" autocomplete="off"></label>
+        <div class="sorts slim">${PERIODS.map(([k, l]) => `<button class="seg ${S.period === k ? "on" : ""}" data-act="period" data-k="${k}">${l}</button>`).join("")}</div>
         <div class="plan"></div>
         ${vaultHtml()}
         ${foot()}`;
@@ -1246,6 +1352,16 @@
         renderPlan();
       });
       renderPlan();
+      // The swing and holding estimates need every stock's daily history.
+      const acrs = Object.keys(data.live || {}).filter((a) => a !== "TCSE");
+      acrs.forEach((a) => {
+        if (!data.daily[a]) {
+          const c = store.get("d_" + a, null);
+          if (c) data.daily[a] = c;
+        }
+      });
+      const stale = !acrs.length || acrs.some((a) => !data.daily[a] || Date.now() - data.daily[a].t > DAILY_TTL);
+      if (stale && !data.dailyLoading) (data.live ? Promise.resolve() : loadLive()).then(() => loadAllDaily(() => S.tab === "planner" && !data.dailyLoading && renderPlan()));
     });
   }
 
@@ -1273,28 +1389,58 @@
       <p class="muted small">Tip: parking in a stock you're building a block in does two jobs at once.</p>`;
   }
 
+  // Everything your money could do over the chosen period, each with the WHOLE amount, best first.
   function renderPlan() {
     const box = $(".plan");
     if (!box || !data.market) return;
-    const bankPct = bankApr();
-    if (!S.budget) {
-      box.innerHTML = `<p class="muted">Type an amount. The planner picks the blocks with the best yearly return you can afford, one at a time${bankPct ? `, and skips anything that pays less than your bank (${bankPct}%)` : ""}.</p>`;
+    const A = S.budget;
+    const [, plabel, days] = PERIODS.find((x) => x[0] === S.period) || PERIODS[2];
+    if (!A) {
+      box.innerHTML = `<p class="muted">Type an amount (like <b>20m</b>) and pick a period. You'll see what the whole amount would earn in the bank, in benefit blocks, swing trading or just holding a stock, with the best one on top.</p>`;
       return;
     }
-    const p = plan(S.budget);
-    const spent = S.budget - p.left;
-    const income = p.picks.reduce((a, x) => a + x.perYear, 0);
-    const bank = bankPct / 100;
-    const inBank = Math.min(p.left, BANK_LIMIT);
+    const loadingHist = data.dailyLoading || !Object.keys(data.daily).length;
+    const bank = bankOver(A, days);
+    const blocks = blocksOver(A, days);
+    const sw = loadingHist ? null : bestSwing(days);
+    const hold = loadingHist ? [] : holdStretches(days);
+    const opts = [];
+    if (bank)
+      opts.push({ key: "bank", safe: true, gain: bank.gain, title: `🏦 Put ${A > BANK_LIMIT ? money(BANK_LIMIT) : `all ${money(A)}`} in the bank`,
+        sub: `${bank.term ? `${bank.term} term${bank.times > 1 ? ` × ${bank.times}` : ""}, ` : ""}${bank.apr}%/yr · no risk, money locked${A > BANK_LIMIT ? ` · one investment takes at most ${money(BANK_LIMIT)}` : ""}` });
+    // Blocks only count as their own option when they beat the bank; then the rest of the money goes to the bank.
+    if (blocks && blocks.p.picks.length && (!bank || blocks.gain > bank.gain)) {
+      const p = blocks.p;
+      const names = p.picks.map((x) => `${x.s.acr}${x.block > 1 ? " #" + x.block : ""}`).join(", ");
+      opts.push({ key: "blocks", safe: true, gain: blocks.gain,
+        title: `🎯 Buy ${p.picks.length > 1 ? "blocks" : "the block"}: ${esc(names)}${p.left > 0 && bank ? ` + ${money(Math.min(p.left, BANK_LIMIT))} in the bank` : ""}`,
+        sub: `payouts ${money(blocks.pay)}${blocks.bank && p.left > 0 ? ` + bank ${money(blocks.bank.gain)}` : ""} · share price can move`,
+        more: `<details class="more"><summary>What to buy</summary><ol class="steps">${p.picks.map((x) => `<li>Buy <b>${shares(x.need)} ${esc(x.s.acr)}</b> (${money(x.cost)}) → ${ordinal(x.block)} ${x.s.type === "passive" ? "perk" : "block"} <span class="pill ${roiClass(x.roi)}">${pctTxt(x.roi)}/yr</span><small class="muted">${x.s.type === "passive" ? esc(x.s.desc) : `${esc(x.pv.how)} every ${x.s.freq} days`}</small></li>`).join("")}</ol></details>` });
+    }
+    if (sw)
+      opts.push({ key: "swing", gain: A * sw.mid, lo: A * sw.lo, hi: A * sw.hi, title: `📈 Swing trade ${esc(sw.acr)} (in the buy zone now)`,
+        sub: `typical result from ${sw.n} similar starts last year · can lose`, acr: sw.acr });
+    if (hold.length)
+      opts.push({ key: "hold", gain: A * pctl(hold, 0.5), lo: A * pctl(hold, 0.1), hi: A * pctl(hold, 0.9), title: "📊 Just buy a stock and hold it", sub: `typical ${plabel} for any stock last year · can lose` });
+    opts.sort((a, b) => b.gain - a.gain);
+    const best = opts[0];
+    const short = !blocks || !blocks.p.picks.length ? cheapestGoodBlock(A) : null;
+    const line = (o, isBest) => `<div class="opt ${isBest ? "best" : ""}">
+        <div class="crow"><span class="grow">${isBest ? "✅ <b>Best:</b> " : ""}${o.title}</span>
+          <b class="${o.gain > 0 ? "g" : o.gain < 0 ? "r" : ""}">${o.gain >= 0 ? "+" : ""}${money(o.gain)}</b></div>
+        <div class="line small muted">${o.sub}${o.lo != null ? ` · range ${o.lo >= 0 ? "+" : ""}${money(o.lo)} to ${o.hi >= 0 ? "+" : ""}${money(o.hi)}` : ""}${o.safe ? "" : " ⚠"}${o.acr ? ` ${stockLink(o.acr, "chart ›")}` : ""}</div>
+        ${o.more || ""}</div>`;
     box.innerHTML = `
-      ${p.picks.length ? `<ol class="steps">${p.picks.map((x) => `<li>
-          Buy <b>${shares(x.need)} ${esc(x.s.acr)}</b> (${money(x.cost)}) → ${ordinal(x.block)} ${esc(x.s.acr)} ${x.s.type === "passive" ? "perk" : "block"}
-          <span class="pill ${roiClass(x.roi)}">${pctTxt(x.roi)}/yr</span>
-          <small class="muted">${x.s.type === "passive" ? esc(x.s.desc) : `${esc(x.pv.how)} every ${x.s.freq} days`}${x.belowBank ? " · less than the bank, but the bank is full" : ""}</small></li>`).join("")}</ol>
-        <div class="sum">Spend <b>${money(spent)}</b> → about <b class="g">${money(income)}/yr</b> in payouts (${pctTxt(spent ? income / spent : 0)}/yr)</div>`
-        : `<p class="muted">Nothing worth buying with ${money(S.budget)}${bank ? ` that beats your bank (${bankPct}%)` : ""}.</p>`}
-      ${p.left > 0 ? `<div class="sum">Left over: <b>${money(p.left)}</b>${bank ? ` → the bank (${bankPct}%/yr) pays about ${money(inBank * bank)}/yr${p.left > BANK_LIMIT ? ` on ${money(BANK_LIMIT)} (the most one investment takes)` : ""}` : ""}${p.next ? `${bank ? ";" : ""} or save toward <b>${esc(p.next.s.acr)}</b> ${ordinal(p.next.block)} block (${money(p.next.cost)}, ${pctTxt(p.next.roi)}/yr)` : ""}.</div>` : ""}
-      <p class="muted small">Buy on the <a href="${STOCKS_PAGE}" target="_top">stock market page</a>. Prices move every minute, so check the cost there. Share prices also go up and down, so a block can be worth less (or more) when you sell.</p>`;
+      <p class="ptitle">${money(A)} over ${plabel}</p>
+      ${best ? line(best, true) : `<p class="muted">No options yet.${data.bank || S.bankApr ? "" : " Set your bank rate in ⚙."}</p>`}
+      ${best && best.safe === undefined ? `<p class="small a">This best option can also lose money; the number is its typical result, not a promise.</p>` : ""}
+      ${opts.length > 1 ? `<p class="small muted">Compared with (all ${money(A)} in each):</p>${opts.slice(1).map((o) => line(o, false)).join("")}` : ""}
+      ${!sw && !loadingHist ? `<div class="opt"><div class="line small muted">📈 Swing trade: ${bestSwing.why === "history" ? `not enough price history to estimate ${plabel}; try a shorter period.` : "no stock is in the buy zone right now. Swing traders wait (the Trade tab shows when one gets there)."}</div></div>` : ""}
+      ${loadingHist ? `<div class="opt"><div class="line small muted"><span class="spin">⟳</span> Loading price history for the swing and holding estimates…</div></div>` : ""}
+      ${short ? `<div class="opt"><div class="line small">🎯 Cheapest block that beats the bank: <b>${esc(short.s.acr)}</b> costs ${money(short.cost)}, <b>${money(short.cost - A)} more</b> than you have. Then ${esc(short.pv.how)} every ${short.s.freq} days (${pctTxt(short.roi)}/yr).</div><div class="bar"><i style="width:${Math.min(100, (A / short.cost) * 100).toFixed(0)}%"></i></div></div>` : ""}
+      <div class="opt"><div class="line small muted">✖ Day trading (minutes or hours): ≈ $0 or less. Torn prices move about 0.05% in an hour, less than the 0.1% fee.</div></div>
+      ${!bank ? `<p class="small muted">Bank: <button class="link" data-act="tab" data-tab="settings">set your rate</button> or add an API key to load Torn's rates.</p>` : ""}
+      <p class="muted small">Estimates from last year's real prices and today's item values. Past results don't promise future ones.</p>`;
   }
 
   // ---------------------------------------------------------------- trade
@@ -1636,7 +1782,7 @@
           <div class="stat"><span>Payouts</span><b>${money(income)}/yr</b><small>${tv ? pctTxt(income / tv) + " of value" : ""}</small></div>
           <div class="stat"><span>Ready to collect</span><b class="${ready.length ? "a" : ""}">${ready.length ? ready.map((r) => esc(r.s.acr)).join(", ") : "none"}</b></div>
         </div>
-        <div class="cards">${rows.map(holdingCard).join("")}</div>` : `<p class="muted">You don't own any shares yet. The <b>Advisor</b> and <b>Planner</b> tabs show what's worth buying.</p>`}
+        <div class="cards">${rows.map(holdingCard).join("")}</div>` : `<p class="muted">You don't own any shares yet. The <b>Advisor</b> and <b>Money</b> tabs show what's worth buying.</p>`}
         ${foot()}`;
     });
   }
@@ -1873,6 +2019,11 @@
       paper = paperNew(amt);
       savePaper();
       render();
+    } else if (act === "period") {
+      S.period = b.dataset.k;
+      save();
+      $$("[data-act=period]").forEach((x) => x.classList.toggle("on", x.dataset.k === S.period));
+      renderPlan();
     } else if (act === "tsort") {
       S.tradeSort = b.dataset.k;
       save();
@@ -2052,6 +2203,13 @@ input.num { width: 90px; }
 .sortby .link { color: var(--muted); text-decoration: none; }
 .sortby .link.on { color: var(--acc); font-weight: 700; }
 .log { display: grid; gap: 4px; }
+.ptitle { font-weight: 700; font-size: 15px; margin: 12px 2px 4px; }
+.opt { background: var(--bg2); border: 1px solid var(--line); border-radius: 12px; padding: 9px 10px; margin: 6px 0; }
+.opt.best { border-color: rgba(127,220,111,.6); background: rgba(127,220,111,.06); }
+.opt .crow b { font-size: 15px; white-space: nowrap; }
+.opt details.more summary { cursor: pointer; color: var(--acc); font-size: 13px; margin-top: 4px; }
+.bar { height: 6px; border-radius: 3px; background: var(--bg3); margin-top: 6px; overflow: hidden; }
+.bar i { display: block; height: 100%; background: var(--acc); }
 .toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); z-index: 2147483003; background: var(--bg3); color: var(--text);
   border: 1px solid var(--line); border-radius: 10px; padding: 9px 14px; font-size: 14px; box-shadow: 0 4px 14px rgba(0,0,0,.4); }
 .toast.bad { border-color: var(--r); }
