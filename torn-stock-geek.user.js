@@ -1,13 +1,14 @@
 // ==UserScript==
 // @name         Torn Stock Geek
 // @namespace    https://github.com/SarcasticGeekJr/torn-stock-geek
-// @version      0.6.0
+// @version      0.7.0
 // @description  A stock advisor for Torn: compares what your money would earn in the bank, blocks, swing trading or holding; ranks the next benefit block of every stock by yearly return, plans what to buy with your cash, compares with your bank rate, tracks your portfolio, shows price charts with swing-trading signals, tests trading methods on each stock's real prices, has a practice account, price and payout alerts, a trade plan, and a fill-amount helper on the stock page. Built for Torn PDA, works in Tampermonkey too.
 // @author       SarcasticGeekJr
 // @match        https://www.torn.com/*
 // @grant        GM_xmlhttpRequest
 // @connect      api.torn.com
 // @connect      tornsy.com
+// @connect      ntfy.sh
 // @connect      raw.githubusercontent.com
 // @run-at       document-end
 // @homepageURL  https://github.com/SarcasticGeekJr/torn-stock-geek
@@ -24,6 +25,7 @@
  *     v1 /user/?selections=stocks          your shares, buy prices, payout progress              (Limited key)
  *     v2 /torn/items                       item market values, to price item payouts             (Public key)
  *     v1 /market/?selections=pointsmarket  points price, for payouts in points                   (Public key)
+ *   ntfy (https://ntfy.sh, free, no account): alerts are also sent as phone notifications to your own topic.
  *   Tornsy (https://tornsy.com/api, free, no key): price history of every stock, collected each minute.
  *     /stocks?interval=h24,d7              current prices plus 24h and 7d ago
  *     /{acronym}?interval=d1&limit=760     daily candles [time, open, high, low, close, total_shares]
@@ -42,7 +44,7 @@
 
   // ---------------------------------------------------------------- config
   const PDA_KEY = "###PDA-APIKEY###"; // Torn PDA replaces this with your key at runtime
-  const VERSION = "0.6.0"; // keep in sync with @version above
+  const VERSION = "0.7.0"; // keep in sync with @version above
   const UPDATE_URL = "https://raw.githubusercontent.com/SarcasticGeekJr/torn-stock-geek/main/torn-stock-geek.user.js";
   const TORN = "https://api.torn.com";
   const TORNSY = "https://tornsy.com/api";
@@ -80,6 +82,7 @@
     vibrate: true,
     payoutAlert: true, // tell me when a benefit payout is ready to collect
     inbox: [], // alerts that went off: { t, acr, text, seen }
+    ntfyTopic: "", // ntfy.sh topic for phone notifications ("" = off)
     range: "1M", // chart range
     custom: {}, // acronym -> $ value of one payout (active) or $ per year (passive), set by the user
     fab: null, // { right, bottom } in px once dragged
@@ -160,6 +163,49 @@
       await sleep(2100);
     }
     throw new Error("Torn PDA didn't return a response");
+  }
+
+  // POST, for sending notifications. Same order as GET: Torn PDA, then Tampermonkey, then fetch.
+  async function httpPost(url, body, headers = {}) {
+    if (typeof window.PDA_httpPost === "function") {
+      const r = await window.PDA_httpPost(url, headers, body);
+      if (r && r.status != null && (+r.status < 200 || +r.status >= 300)) throw new Error("HTTP " + r.status);
+      return r;
+    }
+    if (typeof GM_xmlhttpRequest === "function") {
+      return new Promise((res, rej) =>
+        GM_xmlhttpRequest({
+          method: "POST",
+          url,
+          headers,
+          data: body,
+          timeout: 15000,
+          onload: (r) => (r.status >= 200 && r.status < 300 ? res(r) : rej(new Error("HTTP " + r.status))),
+          onerror: () => rej(new Error("Network error")),
+          ontimeout: () => rej(new Error("Timed out")),
+        })
+      );
+    }
+    const r = await fetch(url, { method: "POST", headers, body });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    return r;
+  }
+
+  // ntfy phone notification. Title goes in a header, which must be plain ASCII, so emoji go in Tags.
+  const NTFY = "https://ntfy.sh/";
+  const ntfyTopicOk = (t) => /^[A-Za-z0-9_-]{1,64}$/.test(t || "");
+  function sendNtfy(text, opts = {}) {
+    if (!ntfyTopicOk(S.ntfyTopic)) return Promise.resolve(false);
+    const headers = {
+      Title: (opts.title || "Torn Stock Geek").replace(/[^\x20-\x7E]/g, ""),
+      Tags: opts.tags || "chart_with_upwards_trend",
+      Click: opts.click || STOCKS_PAGE,
+    };
+    if (opts.priority) headers.Priority = String(opts.priority);
+    return httpPost(NTFY + S.ntfyTopic, text, headers).then(
+      () => true,
+      (e) => (/429/.test(e.message) ? "busy" : false)
+    );
   }
 
   const memo = new Map(); // url -> { t, p, done }
@@ -956,7 +1002,8 @@
   // Checked once a minute while any Torn page is open (one tab does the checking). Nothing runs when Torn is closed.
   const MON_EVERY = 60 * 1000;
   const alertCount = () => Object.keys(S.alerts).length;
-  function notify(acr, text) {
+  function notify(acr, text, tags) {
+    sendNtfy(text, { title: `Torn Stock Geek: ${acr}`, tags: tags || "bell", priority: 4 });
     S.inbox.unshift({ t: Date.now(), acr, text, seen: false });
     S.inbox = S.inbox.slice(0, 20);
     save();
@@ -1013,8 +1060,8 @@
           else data.daily[acr] = c;
           const z = signal(acr).zone;
           if (z && z !== a.last) {
-            if (z === "buy") notify(acr, `${acr} entered the buy zone (${price(px)}). ${overshootLine(acr, "buy", px)}`.trim());
-            if (z === "sell") notify(acr, `${acr} entered the sell zone (${price(px)}). ${overshootLine(acr, "sell", px)}`.trim());
+            if (z === "buy") notify(acr, `${acr} entered the buy zone (${price(px)}). ${overshootLine(acr, "buy", px)}`.trim(), "green_circle");
+            if (z === "sell") notify(acr, `${acr} entered the sell zone (${price(px)}). ${overshootLine(acr, "sell", px)}`.trim(), "red_circle");
             a.last = z;
             changed = true;
           }
@@ -1037,7 +1084,7 @@
         if (!st || !h.payout || !h.payout.ready || st.type !== "active") continue;
         if (told[st.acr] === day) continue;
         told[st.acr] = day;
-        notify(st.acr, `${st.acr} payout is ready to collect on the stock market page.`);
+        notify(st.acr, `${st.acr} payout is ready to collect on the stock market page.`, "moneybag");
       }
       store.set("payTold", told);
     }
@@ -1892,9 +1939,19 @@
       <label class="tog"><span>Alerts on</span><input type="checkbox" class="set-alerts" ${S.alertsOn ? "checked" : ""} style="width:auto"></label>
       <label class="tog"><span>Vibrate</span><input type="checkbox" class="set-vibrate" ${S.vibrate ? "checked" : ""} style="width:auto"></label>
       <label class="tog"><span>Payout ready to collect (Limited key)</span><input type="checkbox" class="set-payout" ${S.payoutAlert ? "checked" : ""} style="width:auto"></label>
-      <p class="muted small">Alerts are checked once a minute while any Torn page is open (Torn PDA or browser). They can't reach you when Torn is closed. For alerts with the app closed, Torn PDA has its own stock alerts.</p>
+      <p class="muted small">Alerts are checked once a minute while any Torn page is open (Torn PDA or browser). Nothing is checked when Torn is closed everywhere. Add phone notifications below to get alerts in your phone's notification bar.</p>
       ${alertCount() ? `<div class="cards">${Object.entries(S.alerts).map(([a, x]) => `<div class="card crow"><span class="grow">${stockLink(a, `<b>${esc(a)}</b>`)} ${[x.above ? `above ${price(x.above)}` : "", x.below ? `below ${price(x.below)}` : "", x.zone ? "swing zones" : ""].filter(Boolean).join(" · ")}</span><button class="link" data-act="aclear" data-acr="${esc(a)}">Remove</button></div>`).join("")}</div>` : `<p class="muted small">No alerts set. Add them on any stock's page.</p>`}
       ${S.inbox.length ? `<p class="small"><b>Recent:</b></p><div class="log">${S.inbox.slice(0, 8).map((x) => `<div class="small"><span class="muted">${new Date(x.t).toISOString().slice(5, 16).replace("T", " ")}</span> ${esc(x.text)}</div>`).join("")}</div>` : ""}
+      <h3>📲 Phone notifications (ntfy)</h3>
+      <p class="muted small">Get every alert in your phone's notification bar with the free <b>ntfy</b> app (no account).</p>
+      <ol class="small muted setup">
+        <li>Install <b>ntfy</b> from the Play Store or App Store.</li>
+        <li>In ntfy tap <b>+</b> (Subscribe to topic) and type your topic below. Leave the server as ntfy.sh.</li>
+        <li>Tap <b>Send test</b> here.</li>
+      </ol>
+      <div class="pbuy"><input class="set-ntfy" value="${esc(S.ntfyTopic)}" placeholder="your topic" autocomplete="off" autocapitalize="off" spellcheck="false">
+        <button class="btn ghost" data-act="ntfynew">New</button><button class="btn" data-act="ntfytest">Send test</button></div>
+      <p class="muted small">Anyone who knows the topic name can read it, so keep the random one. Alerts are only checked while Torn is open somewhere. Your phone may pause Torn PDA in the background, so for alerts while you're away, leave Torn open in a browser on a computer. Empty = off.</p>
       <h3>About</h3>
       <div class="about">
         <div><b>Torn Stock Geek v${VERSION}</b></div>
@@ -1926,6 +1983,13 @@
     tog(".set-alerts", "alertsOn");
     tog(".set-vibrate", "vibrate");
     tog(".set-payout", "payoutAlert");
+    $(".set-ntfy").addEventListener("change", (e) => {
+      const t = e.target.value.trim();
+      if (t && !ntfyTopicOk(t)) return toast("Topic: letters, numbers, - and _ only", "bad");
+      S.ntfyTopic = t;
+      save();
+      toast(t ? "Topic saved" : "Phone notifications off");
+    });
     $(".set-merits").addEventListener("change", (e) => {
       S.merits = Math.max(0, Math.min(10, parseInt(e.target.value, 10) || 0));
       save();
@@ -2059,6 +2123,20 @@
       paper = paperNew(amt);
       savePaper();
       render();
+    } else if (act === "ntfynew") {
+      const t = "tsg-" + Array.from(crypto.getRandomValues(new Uint8Array(8)), (x) => "abcdefghijkmnpqrstuvwxyz23456789"[x % 32]).join("");
+      S.ntfyTopic = t;
+      save();
+      $(".set-ntfy").value = t;
+      toast("New topic made. Subscribe to it in the ntfy app.", "", 3500);
+    } else if (act === "ntfytest") {
+      const t = ($(".set-ntfy") || {}).value ? $(".set-ntfy").value.trim() : S.ntfyTopic;
+      if (!ntfyTopicOk(t)) return toast("Tap New to make a topic first", "bad");
+      S.ntfyTopic = t;
+      save();
+      sendNtfy("Test from Torn Stock Geek. Alerts will arrive like this.", { tags: "white_check_mark" }).then((ok) =>
+        toast(ok === true ? "Test sent. Check the ntfy app." : ok === "busy" ? "ntfy says too many messages; try again in a few minutes." : "Couldn't send. Check your connection.", ok === true ? "" : "bad", 3500)
+      );
     } else if (act === "zonealert") {
       const acr = b.dataset.acr;
       S.alerts[acr] = Object.assign({ above: 0, below: 0 }, S.alerts[acr], { zone: true, last: signal(acr).zone || "" });
@@ -2254,6 +2332,7 @@ input.num { width: 90px; }
 .opt.best { border-color: rgba(127,220,111,.6); background: rgba(127,220,111,.06); }
 .opt .crow b { font-size: 15px; white-space: nowrap; }
 .opt details.more summary { cursor: pointer; color: var(--acc); font-size: 13px; margin-top: 4px; }
+.setup { margin: 4px 0 6px; padding-left: 20px; }
 .btn.small { height: 30px; font-size: 13px; padding: 0 10px; margin-top: 6px; }
 .bar { height: 6px; border-radius: 3px; background: var(--bg3); margin-top: 6px; overflow: hidden; }
 .bar i { display: block; height: 100%; background: var(--acc); }

@@ -53,7 +53,8 @@ Tap the 📈 button (you can drag it).
 - Per stock: price above / below, or when it enters the swing buy or sell zone.
 - Zone reminders come with a one-line warning in prices, from that stock's last year, e.g. "It could still drop: last year it usually went down to about $323.68 (lowest $314.60) before bouncing." The same line shows on the stock's page.
 - Benefit payout ready to collect (Limited key).
-- A banner on any Torn page, a badge on the 📈 button, and a vibration. Checked once a minute **while a Torn page is open**; they can't reach you when Torn is closed.
+- A banner on any Torn page, a badge on the 📈 button, and a vibration. Checked once a minute **while a Torn page is open** (on your phone or a computer).
+- **📲 Phone notifications with ntfy** (free app, no account): ⚙ Settings → tap **New** for a private topic, subscribe to it in the ntfy app, tap **Send test**. Every alert then also arrives as a phone notification. Alerts are only checked while Torn is open somewhere; your phone may pause Torn PDA in the background, so leave Torn open in a browser on a computer to get them while you're away.
 
 **📈 Fill shares (on Torn's stock market page)**
 - Open a stock's BUY or SELL panel: under Torn's shares box you get buttons like "Plan $100m: 114,429", "For block 2: 1,000,000" or "All but blocks: 100,000". Tapping one only types the number. You still press BUY/SELL and confirm.
